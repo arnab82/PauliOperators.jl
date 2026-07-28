@@ -281,9 +281,11 @@ EnergyVarianceCorrection(ψ::Ket{N}) where N = EnergyVarianceCorrection{N}(ψ, 0
 # ============================================================
 # Single-pass truncation deltas (fast corrections)
 # ============================================================
-# For pure-drop truncations (everything compilable to a MergeFilter), the
-# corrections can be computed exactly from the dropped terms alone: writing
-# O = A + B with B the dropped part,
+# A truncation is "pure-drop" when every surviving coefficient is left
+# unchanged: O_after = O_before - B, with B exactly the deleted terms.
+# Any strategy compilable to a MergeFilter is pure-drop by construction --
+# `should_drop` can only keep or discard a term, never modify it. For these,
+# the corrections can be computed exactly from the dropped terms alone:
 #
 #     Δ⟨O⟩  = -⟨B⟩
 #     ΔVar  = -( Var(B) + 2·cov(A,B) ),  cov(A,B) = Re⟨a|b⟩ - ⟨A⟩⟨B⟩
@@ -294,10 +296,19 @@ EnergyVarianceCorrection(ψ::Ket{N}) where N = EnergyVarianceCorrection{N}(ψ, 0
 # correction costs O(#dropped) at the drop sites plus ONE sweep of the kept
 # terms with lookups into a (#dropped)-entry dict.
 #
-# `TruncationDelta` is the drop sink: kernels call `_sink_drop!` on each
-# net-merged coefficient the filter rejects, and `_finalize_delta!` folds the
-# result into the correction accumulator. Ket bits are keyed as Int128
-# (`% Int128` reinterprets the SPV's unsigned words losslessly).
+# Everything NOT expressible as a keep/drop filter -- strategies that rescale
+# survivors or choose data-dependent thresholds, user-defined strategies, and
+# user-defined accumulators -- takes the measured before/after fallback in
+# `truncate!` below, which is correct for arbitrary `_apply!` behavior and
+# doubles as the reference implementation the delta path is tested against.
+#
+# `TruncationDelta` collects the dropped terms. It is passed into the
+# merge/compact kernels, which call `_sink_drop!(Δ, z, x, c)` at the branch
+# where they discard a term ("here is a term I am throwing away"); the kernel
+# is otherwise unchanged, and passing `nothing` compiles the callback away.
+# After the pass, `_finalize_delta!` folds the collected B into the
+# correction accumulator. Ket bits are keyed as Int128 (`% Int128`
+# reinterprets the SPV's unsigned words losslessly).
 
 mutable struct TruncationDelta
     ψv::Int128                      # reference ket bits
@@ -431,11 +442,13 @@ implementing `_apply!(O, s)`. New correction types are defined by subtyping
 """
 function truncate!(O::AnyPauliSum, strategy::TruncationStrategy,
                    corr::CorrectionAccumulator=NoCorrection())
-    # Fast path: pure-drop (compilable) strategies with the built-in
-    # accumulators use the single-pass delta formula instead of full
-    # before/after measurements. Strategies that rescale surviving
-    # coefficients (e.g. StochasticSamplingTruncation) are not pure drops and
-    # take the measure-based fallback below.
+    # Fast path: filter-compilable strategies (pure-drop by construction)
+    # with the built-in accumulators use the single-pass delta formula
+    # instead of full before/after measurements. Everything else -- rescaling
+    # strategies (survivors change, e.g. StochasticSamplingTruncation),
+    # data-dependent thresholds (AdaptiveTruncation), user-defined strategies
+    # or accumulators -- takes the measured fallback below, which assumes
+    # nothing about what `_apply!` does.
     if corr isa Union{EnergyCorrection,EnergyVarianceCorrection} &&
        !(strategy isa NoTruncation) && _is_compilable(strategy)
         Δ = TruncationDelta(corr.ψ)
