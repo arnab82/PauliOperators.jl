@@ -323,7 +323,13 @@ end
 # (out, overflowed); on overflow nothing is swapped and live is untouched
 # (the merge only reads live/ws and writes scratch), so the caller can grow
 # and retry.
-function _try_merge!(v::SparsePauliVector{N,W,T}, m::Int, f::MergeFilter) where {N,W,T}
+# `sink` observes each net-merged coefficient the filter rejects (see
+# TruncationDelta in truncation.jl); `nothing` compiles to today's kernel.
+# The sink is reset at the start of every attempt so a grow-and-retry after
+# overflow doesn't double-count drops.
+function _try_merge!(v::SparsePauliVector{N,W,T}, m::Int, f::MergeFilter,
+                     sink::Union{Nothing,TruncationDelta}=nothing) where {N,W,T}
+    sink === nothing || empty!(sink.b)
     n = v.n
     z, x, c = v.z, v.x, v.c
     sz, sx, sc = v.sz, v.sx, v.sc
@@ -348,7 +354,10 @@ function _try_merge!(v::SparsePauliVector{N,W,T}, m::Int, f::MergeFilter) where 
             acc += ws[j][3]
             j += 1
         end
-        should_drop(f, kz, kx, abs(acc)) && continue
+        if should_drop(f, kz, kx, abs(acc))
+            _sink_drop!(sink, kz, kx, acc)
+            continue
+        end
         out += 1
         out <= cap || return out, true
         sz[out] = kz
@@ -374,12 +383,13 @@ append cursor. Allocation-free in steady state; grows the live buffers
 (chunked doubling) if the merged population exceeds capacity — a boundary
 allocation, never a hot-loop one.
 """
-function _merge_spv!(v::SparsePauliVector{N,W,T}, m::Int, f::MergeFilter) where {N,W,T}
+function _merge_spv!(v::SparsePauliVector{N,W,T}, m::Int, f::MergeFilter,
+                     sink::Union{Nothing,TruncationDelta}=nothing) where {N,W,T}
     n_in = v.n + m
-    out, ovf = _try_merge!(v, m, f)
+    out, ovf = _try_merge!(v, m, f, sink)
     while ovf
         _grow_live!(v, v.n + m)
-        out, ovf = _try_merge!(v, m, f)
+        out, ovf = _try_merge!(v, m, f, sink)
     end
     v.an = 0
     return n_in, out
@@ -392,10 +402,15 @@ end
 
 # In-place filter of the live buffer (order-preserving, so the sorted
 # invariant survives). Backs the clip family and the compilable _apply!.
-function _compact_spv!(v::SparsePauliVector{N,W,T}, f::MergeFilter) where {N,W,T}
+# `sink` observes dropped terms (nothing = today's kernel).
+function _compact_spv!(v::SparsePauliVector{N,W,T}, f::MergeFilter,
+                       sink::Union{Nothing,TruncationDelta}=nothing) where {N,W,T}
     out = 0
     @inbounds for i in 1:v.n
-        should_drop(f, v.z[i], v.x[i], abs(v.c[i])) && continue
+        if should_drop(f, v.z[i], v.x[i], abs(v.c[i]))
+            _sink_drop!(sink, v.z[i], v.x[i], v.c[i])
+            continue
+        end
         out += 1
         if out != i
             v.z[out] = v.z[i]

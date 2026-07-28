@@ -252,30 +252,47 @@ _needs_merged_measure(::NoCorrection) = false
 _needs_merged_measure(::EnergyCorrection) = false
 _needs_merged_measure(::CorrectionAccumulator) = true
 
-# Window/early boundary: measure → merge (strict filter) → generic _apply!
-# for non-compilable strategies → measure → accumulate. Corrections capture
-# exactly the truncation loss.
+# Window/early boundary. Three routes:
+#  1. Built-in accumulators + compilable strategy (the production hot path):
+#     single strict-filter merge with a TruncationDelta drop sink, then the
+#     exact single-pass delta correction (see truncation.jl) — no full
+#     before/after measurements, no unfiltered-merge-then-recompact phase.
+#  2. Other corrections needing merged measurement (`_needs_merged_measure`):
+#     unfiltered merge → measure → truncate → measure → accumulate.
+#  3. NoCorrection / linear-on-pre-merge: measure → strict merge → apply →
+#     measure → accumulate.
+# NOTE (all routes): drops by the LOCAL filter inside _rotate_range! are not
+# observed by corrections; correction-tracked runs should keep
+# local_truncation = NoTruncation (the default).
 function _boundary!(O::SparsePauliVector{N,W}, f::MergeFilter, strategy::S,
                     compiled::Bool, correction::CorrectionAccumulator,
                     counters::Union{Nothing,WindowCounters},
                     w::Int,
                     mask::Union{Nothing,Tuple{W,W}}=nothing) where {N,W,S<:TruncationStrategy}
     local before, n_in, n_out
-    if _needs_merged_measure(correction)
+    if correction isa Union{EnergyCorrection,EnergyVarianceCorrection} && compiled
+        Δ = TruncationDelta(correction.ψ)
+        m = _gather_append!(O)
+        _sort_pending!(O, m, mask)
+        n_in, n_out = _merge_spv!(O, m, f, Δ)
+        _finalize_delta!(correction, Δ, O)
+    elseif _needs_merged_measure(correction)
         m = _gather_append!(O)
         _sort_pending!(O, m, mask)
         n_in, n_out = _merge_spv!(O, m, NOFILTER)
         before = _measure(O, correction)
         compiled ? _compact_spv!(O, f) : _apply!(O, strategy)
+        after = _measure(O, correction)
+        _accumulate!(correction, before, after)
     else
         before = _measure(O, correction)
         m = _gather_append!(O)
         _sort_pending!(O, m, mask)
         n_in, n_out = _merge_spv!(O, m, f)
         compiled || _apply!(O, strategy)
+        after = _measure(O, correction)
+        _accumulate!(correction, before, after)
     end
-    after = _measure(O, correction)
-    _accumulate!(correction, before, after)
     if counters !== nothing
         counters.merge_in[w] += n_in
         counters.merge_out[w] += n_out

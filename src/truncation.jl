@@ -279,6 +279,108 @@ EnergyVarianceCorrection(ψ::Ket{N}) where N = EnergyVarianceCorrection{N}(ψ, 0
 
 
 # ============================================================
+# Single-pass truncation deltas (fast corrections)
+# ============================================================
+# For pure-drop truncations (everything compilable to a MergeFilter), the
+# corrections can be computed exactly from the dropped terms alone: writing
+# O = A + B with B the dropped part,
+#
+#     Δ⟨O⟩  = -⟨B⟩
+#     ΔVar  = -( Var(B) + 2·cov(A,B) ),  cov(A,B) = Re⟨a|b⟩ - ⟨A⟩⟨B⟩
+#
+# where b = B|ψ⟩ lives on at most (#dropped) kets and a = A|ψ⟩ is only ever
+# needed on b's support. So instead of the two full ⟨O²⟩ evaluations of the
+# before/after `_measure` route (each builds an O(len(O)) KetSum), the exact
+# correction costs O(#dropped) at the drop sites plus ONE sweep of the kept
+# terms with lookups into a (#dropped)-entry dict.
+#
+# `TruncationDelta` is the drop sink: kernels call `_sink_drop!` on each
+# net-merged coefficient the filter rejects, and `_finalize_delta!` folds the
+# result into the correction accumulator. Ket bits are keyed as Int128
+# (`% Int128` reinterprets the SPV's unsigned words losslessly).
+
+mutable struct TruncationDelta
+    ψv::Int128                      # reference ket bits
+    b::Dict{Int128,ComplexF64}      # B|ψ⟩ amplitudes, keyed by ket bits
+end
+TruncationDelta(ψ::Ket) = TruncationDelta(ψ.v, Dict{Int128,ComplexF64}())
+
+# apply the (z,x) Pauli word to the ket bits kv: same math as
+# Base.:*(::PauliBasis, ::Ket) in multiplication.jl, on raw words
+@inline function _ket_action(z::Int128, x::Int128, kv::Int128)
+    kv2 = x ⊻ kv
+    idx = ((4 - count_ones(z & x) % 4) % 4 + 2 * (count_ones(z & kv2) % 2)) % 4 + 1
+    return PHASE_TBL[idx], kv2
+end
+
+@inline _sink_drop!(::Nothing, z, x, c) = nothing
+@inline function _sink_drop!(Δ::TruncationDelta, z, x, c)
+    ph, kv2 = _ket_action(z % Int128, x % Int128, Δ.ψv)
+    Δ.b[kv2] = get(Δ.b, kv2, zero(ComplexF64)) + ph * c
+    return nothing
+end
+
+# amplitudes of the KEPT operator on b's support (+ the reference ket)
+function _sweep_kept!(adict::Dict{Int128,ComplexF64}, aψ::Base.RefValue{ComplexF64},
+                      v::SparsePauliVector{N,W,T}, ψv::Int128) where {N,W,T}
+    @inbounds for i in 1:v.n
+        ph, kv2 = _ket_action(v.z[i] % Int128, v.x[i] % Int128, ψv)
+        hit = haskey(adict, kv2)
+        (hit || kv2 == ψv) || continue
+        amp = ph * v.c[i]
+        kv2 == ψv && (aψ[] += amp)
+        hit && (adict[kv2] += amp)
+    end
+    return nothing
+end
+
+function _sweep_kept!(adict::Dict{Int128,ComplexF64}, aψ::Base.RefValue{ComplexF64},
+                      O::PauliSum{N}, ψv::Int128) where {N}
+    for (p, c) in O
+        ph, kv2 = _ket_action(p.z, p.x, ψv)
+        hit = haskey(adict, kv2)
+        (hit || kv2 == ψv) || continue
+        amp = ph * c
+        kv2 == ψv && (aψ[] += amp)
+        hit && (adict[kv2] += amp)
+    end
+    return nothing
+end
+
+_finalize_delta!(::NoCorrection, Δ::TruncationDelta, O) = nothing
+
+function _finalize_delta!(corr::EnergyCorrection, Δ::TruncationDelta, O)
+    corr.accumulated_energy += -real(get(Δ.b, Δ.ψv, zero(ComplexF64)))
+    return nothing
+end
+
+function _finalize_delta!(corr::EnergyVarianceCorrection, Δ::TruncationDelta, O)
+    isempty(Δ.b) && return nothing
+    eB = get(Δ.b, Δ.ψv, zero(ComplexF64))       # ⟨ψ|B|ψ⟩ (complex-safe)
+    bb = 0.0                                    # ⟨Bψ|Bψ⟩
+    for amp in values(Δ.b)
+        bb += abs2(amp)
+    end
+    adict = Dict{Int128,ComplexF64}()
+    for k in keys(Δ.b)
+        adict[k] = zero(ComplexF64)
+    end
+    aψ = Ref(zero(ComplexF64))
+    _sweep_kept!(adict, aψ, O, Δ.ψv)
+    ab = zero(ComplexF64)                       # ⟨Aψ|Bψ⟩ (only b's support)
+    for (k, bv) in Δ.b
+        ab += conj(adict[k]) * bv
+    end
+    eA = aψ[]                                   # ⟨ψ|A|ψ⟩
+    # matches variance() = real(‖Oψ‖² − ⟨ψ|O|ψ⟩²) exactly:
+    #   Δ‖Oψ‖² = −(bb + 2Re⟨a|b⟩),  Δ⟨O⟩² = −(2·eA·eB + eB²)
+    corr.accumulated_energy   += -real(eB)
+    corr.accumulated_variance += -(bb + 2 * real(ab)) + real(2 * eA * eB + eB * eB)
+    return nothing
+end
+
+
+# ============================================================
 # measure — snapshot quantities before/after truncation
 # ============================================================
 
@@ -329,9 +431,35 @@ implementing `_apply!(O, s)`. New correction types are defined by subtyping
 """
 function truncate!(O::AnyPauliSum, strategy::TruncationStrategy,
                    corr::CorrectionAccumulator=NoCorrection())
+    # Fast path: pure-drop (compilable) strategies with the built-in
+    # accumulators use the single-pass delta formula instead of full
+    # before/after measurements. Strategies that rescale surviving
+    # coefficients (e.g. StochasticSamplingTruncation) are not pure drops and
+    # take the measure-based fallback below.
+    if corr isa Union{EnergyCorrection,EnergyVarianceCorrection} &&
+       !(strategy isa NoTruncation) && _is_compilable(strategy)
+        Δ = TruncationDelta(corr.ψ)
+        _apply_dropping!(O, _compile_filter(strategy), Δ)
+        _finalize_delta!(corr, Δ, O)
+        return O
+    end
     before = _measure(O, corr)
     _apply!(O, strategy)
     after = _measure(O, corr)
     _accumulate!(corr, before, after)
     return O
 end
+
+# filter with drop-sink observation (pure-drop strategies only)
+function _apply_dropping!(O::PauliSum{N}, f, Δ::TruncationDelta) where {N}
+    filter!(O) do pr
+        p, c = pr
+        if should_drop(f, p.z % UInt128, p.x % UInt128, abs(c))
+            _sink_drop!(Δ, p.z, p.x, c)
+            return false
+        end
+        return true
+    end
+    return O
+end
+_apply_dropping!(v::SparsePauliVector, f, Δ::TruncationDelta) = _compact_spv!(v, f, Δ)
