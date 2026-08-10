@@ -73,8 +73,15 @@ end
 Construct a `Pauli{N}` from integer bitstrings `z` and `x` with scalar `s=1`.
 """
 function Pauli(z::I, x::I, N) where I<:Integer
-    z < Int128(2)^N || throw(DimensionMismatch)
-    x < Int128(2)^N || throw(DimensionMismatch)
+    # bit-level bounds check: `Int128(2)^N` overflows at N = 128, and masks
+    # touching qubit 128 legitimately use the Int128 sign bit. `% UInt128`
+    # reinterprets (sign-extending overflowed smaller ints, which are then
+    # correctly rejected); shifts by >= bitwidth are defined as 0 in Julia.
+    N <= 128 || throw(DimensionMismatch)
+    if N < 128
+        (z % UInt128) >> N == 0 || throw(DimensionMismatch)
+        (x % UInt128) >> N == 0 || throw(DimensionMismatch)
+    end
     return Pauli{N}(1, z, x)
 end
 
