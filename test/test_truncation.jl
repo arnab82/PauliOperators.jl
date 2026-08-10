@@ -354,4 +354,54 @@ using Random
         @test CompositeTruncation([NoTruncation(), CoeffTruncation(0.1)]).strategies isa Tuple
     end
 
+    # The SPV run sinks (EnergyDropSink / XRunDelta) accumulate the exact
+    # correction inside the x-major kernel walk. Three independent answers
+    # must agree: measured before/after (ground truth for pure drops), the
+    # Dict TruncationDelta route, and the SPV run-sink route.
+    @testset "SPV run-sink corrections: exact parity" begin
+        Random.seed!(1234)
+        N = 8
+        for trial in 1:5
+            ψ = Ket{N}(Int128(rand(0:(2^N - 1))))
+            ps = PauliSum(N, ComplexF64)
+            for _ in 1:400
+                p = rand(PauliBasis{N})
+                ps[p] = get(ps, p, 0.0 + 0im) + (2 * rand() - 1) * 0.3
+            end
+            thresh = 0.1
+
+            e0 = real(expectation_value(ps, ψ))
+            v0 = variance(ps, ψ)
+            psc = deepcopy(ps)
+            truncate!(psc, CoeffTruncation(thresh))
+            de_true = real(expectation_value(psc, ψ)) - e0
+            dv_true = variance(psc, ψ) - v0
+            @test abs(dv_true) > 0    # the clip must actually bite
+
+            c_dict = EnergyVarianceCorrection(ψ)
+            ps1 = deepcopy(ps)
+            truncate!(ps1, CoeffTruncation(thresh), c_dict)
+
+            c_spv = EnergyVarianceCorrection(ψ)
+            v = SparsePauliVector(ps)
+            truncate!(v, CoeffTruncation(thresh), c_spv)
+            @test PauliOperators.check_spv(v)
+
+            @test isapprox(c_dict.accumulated_energy, de_true; atol=1e-12)
+            @test isapprox(c_spv.accumulated_energy, de_true; atol=1e-12)
+            @test isapprox(c_dict.accumulated_variance, dv_true; atol=1e-10)
+            @test isapprox(c_spv.accumulated_variance, dv_true; atol=1e-10)
+            @test isapprox(c_spv.accumulated_variance, c_dict.accumulated_variance;
+                           atol=1e-12)
+
+            cE = EnergyCorrection(ψ)
+            v2 = SparsePauliVector(ps)
+            truncate!(v2, CoeffTruncation(thresh), cE)
+            @test isapprox(cE.accumulated_energy, de_true; atol=1e-12)
+
+            # x-run variance specialization against the generic KetSum route
+            @test isapprox(variance(v, ψ), variance(PauliSum(v), ψ); atol=1e-11)
+        end
+    end
+
 end

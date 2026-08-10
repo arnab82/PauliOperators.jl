@@ -331,6 +331,141 @@ end
     return nothing
 end
 
+# ------------------------------------------------------------
+# SparsePauliVector run sinks — exact corrections from the x-major walk
+# ------------------------------------------------------------
+# The SPV truncation kernels (_compact_spv!, _try_merge!) visit terms in
+# x-major sorted order, so all terms sharing an x-string — i.e. all terms
+# mapping the reference ket |ψ⟩ to the SAME target ket ±i^k|ψ ⊻ x⟩ — form a
+# contiguous run. Within a run the A|ψ⟩ / B|ψ⟩ amplitudes on the run's
+# target ket are plain sums of ph·c over kept / dropped terms, so the exact
+# ingredients of the delta formula,
+#     bb = ⟨Bψ|Bψ⟩ = Σ_runs |Σ_drop ph·c|²
+#     ab = ⟨Aψ|Bψ⟩ = Σ_runs conj(Σ_keep ph·c)·(Σ_drop ph·c)
+#     eA = ⟨ψ|A|ψ⟩,  eB = ⟨ψ|B|ψ⟩          (the x = 0 run's two sums)
+# accumulate with O(1) state during the single pass the kernel already
+# makes: no dict, and — unlike the Dict-backed TruncationDelta route — no
+# second sweep over the kept terms. This is the reason the canonical SPV
+# order is x-major (see _key_lt in spv_kernels.jl). Correctness relies on
+# the kernel walk being x-monotone, which the sorted live buffer
+# (_compact_spv!) and the sorted two-stream merge (_try_merge!) guarantee.
+
+# phase of (z,x) acting on |kv⟩ — the phase half of _ket_action, on the
+# SPV's packed word type (the target ket is kv ⊻ x, implicit in the run)
+@inline function _ket_phase(z::W, x::W, kv::W) where {W<:Unsigned}
+    kv2 = x ⊻ kv
+    idx = ((4 - count_ones(z & x) % 4) % 4 + 2 * (count_ones(z & kv2) % 2)) % 4 + 1
+    return PHASE_TBL[idx]
+end
+
+"""
+    EnergyDropSink{W}
+
+Drop sink for `EnergyCorrection` on SparsePauliVector kernels: Δ⟨O⟩ = −⟨B⟩
+needs only the dropped diagonal (x = 0) terms, each contributing ±c by the
+z/ψ parity. No run tracking, no phases beyond a sign, kept terms ignored.
+"""
+mutable struct EnergyDropSink{W<:Unsigned}
+    ψv::W
+    eB::ComplexF64
+end
+
+"""
+    XRunDelta{W}
+
+Drop/keep sink for `EnergyVarianceCorrection` on SparsePauliVector kernels.
+Carries the current x-run's kept/dropped amplitude sums and the finished
+cross-run accumulators (see the block comment above).
+"""
+mutable struct XRunDelta{W<:Unsigned}
+    ψv::W
+    started::Bool
+    cur_x::W
+    kept_run::ComplexF64
+    drop_run::ComplexF64
+    bb::Float64
+    ab::ComplexF64
+    eA::ComplexF64
+    eB::ComplexF64
+end
+XRunDelta(ψv::W) where {W<:Unsigned} =
+    XRunDelta{W}(ψv, false, zero(W), zero(ComplexF64), zero(ComplexF64),
+                 0.0, zero(ComplexF64), zero(ComplexF64), zero(ComplexF64))
+
+@inline function _flush_run!(Δ::XRunDelta{W}) where W
+    Δ.started || return nothing
+    Δ.bb += abs2(Δ.drop_run)
+    Δ.ab += conj(Δ.kept_run) * Δ.drop_run
+    if Δ.cur_x == zero(W)
+        Δ.eA += Δ.kept_run
+        Δ.eB += Δ.drop_run
+    end
+    Δ.kept_run = zero(ComplexF64)
+    Δ.drop_run = zero(ComplexF64)
+    return nothing
+end
+
+@inline function _run_advance!(Δ::XRunDelta{W}, x::W) where W
+    if !Δ.started
+        Δ.started = true
+        Δ.cur_x = x
+    elseif x != Δ.cur_x
+        _flush_run!(Δ)
+        Δ.cur_x = x
+    end
+    return nothing
+end
+
+# keep hooks (only XRunDelta needs to see survivors)
+@inline _sink_keep!(::Nothing, z, x, c) = nothing
+@inline _sink_keep!(::TruncationDelta, z, x, c) = nothing
+@inline _sink_keep!(::EnergyDropSink, z, x, c) = nothing
+@inline function _sink_keep!(Δ::XRunDelta{W}, z::W, x::W, c) where W
+    _run_advance!(Δ, x)
+    Δ.kept_run += _ket_phase(z, x, Δ.ψv) * c
+    return nothing
+end
+
+@inline function _sink_drop!(Δ::EnergyDropSink{W}, z::W, x::W, c) where W
+    x == zero(W) || return nothing
+    Δ.eB += (1 - 2 * (count_ones(z & Δ.ψv) & 1)) * c
+    return nothing
+end
+@inline function _sink_drop!(Δ::XRunDelta{W}, z::W, x::W, c) where W
+    _run_advance!(Δ, x)
+    Δ.drop_run += _ket_phase(z, x, Δ.ψv) * c
+    return nothing
+end
+
+# reset hooks — _try_merge! restarts its walk after an overflow grow-and-retry
+@inline _sink_reset!(::Nothing) = nothing
+@inline _sink_reset!(Δ::TruncationDelta) = (empty!(Δ.b); nothing)
+@inline _sink_reset!(Δ::EnergyDropSink) = (Δ.eB = zero(ComplexF64); nothing)
+@inline function _sink_reset!(Δ::XRunDelta{W}) where W
+    Δ.started = false
+    Δ.cur_x = zero(W)
+    Δ.kept_run = zero(ComplexF64)
+    Δ.drop_run = zero(ComplexF64)
+    Δ.bb = 0.0
+    Δ.ab = zero(ComplexF64)
+    Δ.eA = zero(ComplexF64)
+    Δ.eB = zero(ComplexF64)
+    return nothing
+end
+
+# The union the SPV kernels accept as a drop sink.
+const SPVSink = Union{Nothing, TruncationDelta, EnergyDropSink, XRunDelta}
+
+# sink selection: Dict-backed PauliSum has no term order, so it keeps the
+# TruncationDelta dict route (with its one kept-terms sweep); the SPV
+# kernels get the single-pass run sinks.
+_make_sink(corr::Union{EnergyCorrection,EnergyVarianceCorrection}, ::PauliSum) =
+    TruncationDelta(corr.ψ)
+_make_sink(corr::EnergyCorrection, ::SparsePauliVector{N,W}) where {N,W} =
+    EnergyDropSink{W}((corr.ψ.v % UInt128) % W, zero(ComplexF64))
+_make_sink(corr::EnergyVarianceCorrection, ::SparsePauliVector{N,W}) where {N,W} =
+    XRunDelta((corr.ψ.v % UInt128) % W)
+
 # amplitudes of the KEPT operator on b's support (+ the reference ket)
 function _sweep_kept!(adict::Dict{Int128,ComplexF64}, aψ::Base.RefValue{ComplexF64},
                       v::SparsePauliVector{N,W,T}, ψv::Int128) where {N,W,T}
@@ -359,6 +494,22 @@ function _sweep_kept!(adict::Dict{Int128,ComplexF64}, aψ::Base.RefValue{Complex
 end
 
 _finalize_delta!(::NoCorrection, Δ::TruncationDelta, O) = nothing
+
+function _finalize_delta!(corr::EnergyCorrection, Δ::EnergyDropSink, O)
+    corr.accumulated_energy += -real(Δ.eB)
+    return nothing
+end
+
+function _finalize_delta!(corr::EnergyVarianceCorrection, Δ::XRunDelta, O)
+    _flush_run!(Δ)          # close the trailing run
+    eA = Δ.eA
+    eB = Δ.eB
+    # identical formula to the TruncationDelta route below — only the
+    # gathering of bb/ab/eA/eB differs (single ordered pass vs dict + sweep)
+    corr.accumulated_energy   += -real(eB)
+    corr.accumulated_variance += -(Δ.bb + 2 * real(Δ.ab)) + real(2 * eA * eB + eB * eB)
+    return nothing
+end
 
 function _finalize_delta!(corr::EnergyCorrection, Δ::TruncationDelta, O)
     corr.accumulated_energy += -real(get(Δ.b, Δ.ψv, zero(ComplexF64)))
@@ -451,7 +602,7 @@ function truncate!(O::AnyPauliSum, strategy::TruncationStrategy,
     # nothing about what `_apply!` does.
     if corr isa Union{EnergyCorrection,EnergyVarianceCorrection} &&
        !(strategy isa NoTruncation) && _is_compilable(strategy)
-        Δ = TruncationDelta(corr.ψ)
+        Δ = _make_sink(corr, O)
         _apply_dropping!(O, _compile_filter(strategy), Δ)
         _finalize_delta!(corr, Δ, O)
         return O
@@ -475,4 +626,4 @@ function _apply_dropping!(O::PauliSum{N}, f, Δ::TruncationDelta) where {N}
     end
     return O
 end
-_apply_dropping!(v::SparsePauliVector, f, Δ::TruncationDelta) = _compact_spv!(v, f, Δ)
+_apply_dropping!(v::SparsePauliVector, f, Δ::SPVSink) = _compact_spv!(v, f, Δ)

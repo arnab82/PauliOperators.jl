@@ -254,9 +254,10 @@ _needs_merged_measure(::CorrectionAccumulator) = true
 
 # Window/early boundary. Three routes:
 #  1. Built-in accumulators + compilable strategy (the production hot path):
-#     single strict-filter merge with a TruncationDelta drop sink, then the
-#     exact single-pass delta correction (see truncation.jl) — no full
-#     before/after measurements, no unfiltered-merge-then-recompact phase.
+#     single strict-filter merge with a run sink (EnergyDropSink/XRunDelta,
+#     see truncation.jl) accumulating the exact correction inside the merge
+#     walk itself — no full before/after measurements, no dict, no second
+#     sweep over the kept terms.
 #  2. Other corrections needing merged measurement (`_needs_merged_measure`):
 #     unfiltered merge → measure → truncate → measure → accumulate.
 #  3. NoCorrection / linear-on-pre-merge: measure → strict merge → apply →
@@ -271,7 +272,7 @@ function _boundary!(O::SparsePauliVector{N,W}, f::MergeFilter, strategy::S,
                     mask::Union{Nothing,Tuple{W,W}}=nothing) where {N,W,S<:TruncationStrategy}
     local before, n_in, n_out
     if correction isa Union{EnergyCorrection,EnergyVarianceCorrection} && compiled
-        Δ = TruncationDelta(correction.ψ)
+        Δ = _make_sink(correction, O)
         m = _gather_append!(O)
         _sort_pending!(O, m, mask)
         n_in, n_out = _merge_spv!(O, m, f, Δ)
