@@ -21,4 +21,11 @@ using Test
     include("test_channels.jl")
     include("test_transformations.jl")
     include("test_large_N.jl")
+    include("test_wide.jl")
+end
+
+# Spawns worker processes (addprocs), so it runs outside the main testset and
+# tears them down afterwards. Set PAULI_SKIP_DISTRIBUTED=1 to skip.
+if get(ENV, "PAULI_SKIP_DISTRIBUTED", "0") != "1"
+    include("test_distributed.jl")
 end

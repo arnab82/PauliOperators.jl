@@ -17,7 +17,7 @@ function _spv_distributed_fixture(N)
     O[PauliBasis(Pauli(N; X=[1], Z=[6]))] = -0.11 + 0.2im
     O[PauliBasis(Pauli(N; Y=[2, 5]))] = 0.09 - 0.03im
 
-    gens = PauliBasis{N,PauliOperators.uinttype(N)}[
+    gens = PauliBasis{N,word_type(N)}[
         PauliBasis(Pauli(N; X=[1, 2])),
         PauliBasis(Pauli(N; Y=[3])),
         PauliBasis(Pauli(N; Z=[2, 4])),
@@ -152,13 +152,18 @@ end
 
     # Distributed evolution must reproduce serial evolution exactly (same
     # arithmetic, just hash-partitioned across workers).
-    @testset "distributed == serial (N=$N, storage=$storage)" for N in (10, 14), storage in (:dict, :spv)
+    # N spans the storage-word boundary on purpose: 10/14 are UInt64, 200 is a
+    # BitIntegers UInt256 and 1000 a UInt1024. The hash partition, the
+    # peer-to-peer bucket routing and the shard merges all move raw (z,x) words
+    # between processes, so wide words must survive serialization intact - a
+    # narrow-word bug here would not show up at N=14.
+    @testset "distributed == serial (N=$N, storage=$storage)" for N in (10, 14, 200, 1000), storage in (:dict, :spv)
         O = PauliSum(N)
         O[PauliBasis(Pauli(N; Z=[1, 2]))] = 1.0 + 0.0im
         O[PauliBasis(Pauli(N; Z=[3, 4]))] = 0.5 + 0.0im
         O[PauliBasis(Pauli(N; X=[2]))]    = 0.25 + 0.0im
         # generators chosen to anticommute with some terms -> real branching/growth
-        Tw = PauliOperators.uinttype(N)
+        Tw = word_type(N)
         gens = PauliBasis{N,Tw}[]
         angs = Float64[]
         for k in 1:min(N - 1, 6)
@@ -212,7 +217,9 @@ end
         destroy!(dS)
     end
 
-    @testset "runs at N=1000 (storage=$storage)" for storage in (:dict, :spv)
+    # Truncated evolution at 1000 qubits: the correctness sweep above runs
+    # untruncated, this one exercises the clip-every-rotation path.
+    @testset "truncated evolution at N=1000 (storage=$storage)" for storage in (:dict, :spv)
         N = 1000
         O = PauliSum(N)
         O[PauliBasis(Pauli(N; Z=[1, 2]))] = 1.0 + 0.0im
@@ -223,6 +230,7 @@ end
         evolve!(dO, gens, angs; truncation_thresh=1e-8)
         @test length(dO) >= 1
         @test isfinite(opnorm2(dO))
+        @test word_type(N) === PauliOperators.UInt1024
         destroy!(dO)
     end
 end

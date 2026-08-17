@@ -53,7 +53,12 @@ const NOFILTER = MergeFilter(typemax(Int), typemax(Int), typemax(Int), -1.0,
 
 # `_majorana_weight_bits` lives in helpers.jl (shared with the Dict path).
 
-@inline function should_drop(f::MergeFilter, z::W, x::W, absc::Float64) where {W<:Unsigned}
+# `absc` is `abs(coefficient)`, so it follows the container's coefficient type:
+# Float64 for ComplexF64/Float64 storage, Float32 for ComplexF32/Float32. The
+# MergeFilter thresholds are Float64; comparisons promote, so accepting any
+# Real here keeps reduced-precision coefficients (half the bandwidth, which is
+# the point at 1000 qubits) working on the SPV path as they already do on Dict.
+@inline function should_drop(f::MergeFilter, z::W, x::W, absc::Real) where {W<:Unsigned}
     absc <= f.thresh && return true
     w = count_ones(z | x)
     w > f.wmax && return true
