@@ -22,6 +22,7 @@ using Test
     include("test_transformations.jl")
     include("test_large_N.jl")
     include("test_wide.jl")
+    include("test_threaded.jl")
 end
 
 # Spawns worker processes (addprocs), so it runs outside the main testset and

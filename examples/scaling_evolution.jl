@@ -13,7 +13,7 @@ using Printf
 
 # One first-order Trotter layer of a 1D Heisenberg chain: XX+YY+ZZ on each bond.
 function heisenberg_1d_generators(N)
-    T = PauliOperators.uinttype(N)
+    T = word_type(N)
     gens = PauliBasis{N,T}[]
     for i in 1:N-1
         push!(gens, PauliBasis(Pauli(N; X=[i, i + 1])))

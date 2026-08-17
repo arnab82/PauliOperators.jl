@@ -21,7 +21,7 @@ const STORAGES = Symbol.(split(get(ENV, "PO_BENCH_STORAGE", "dict,spv"), ","))
 
 function make_problem(N::Int, init_terms::Int, ngens::Int)
     rng = MersenneTwister(12345)
-    W = PauliOperators.uinttype(N)
+    W = word_type(N)
     mask = PauliOperators._bitmask(W, N)
     rand_basis() = PauliBasis{N,W}(rand(rng, W) & mask, rand(rng, W) & mask)
     O = PauliSum(N, ComplexF64)

@@ -37,6 +37,7 @@ module PauliOperators
     include("analysis.jl")
     include("channels.jl")
     include("transformations.jl")
+    include("threaded.jl")
     include("distributed.jl")
 
     const ⊗ = otimes
@@ -114,6 +115,10 @@ module PauliOperators
 
     # Transformations
     export jordan_wigner, boson_to_paulis
+
+    # Multithreaded single-operator evolution (shared memory, one node).
+    # Independent of the sharded path below: no worker processes involved.
+    export evolve_threaded!, THREADED_ROTATE_MIN
 
     # Distributed (hash-sharded across Distributed.jl workers; each shard is a
     # local PauliSum or SparsePauliVector, so N > 128 and both backends carry
