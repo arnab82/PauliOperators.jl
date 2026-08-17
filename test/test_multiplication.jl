@@ -11,10 +11,10 @@ using Random
     types = []
     push!(types, PauliBasis{N})
     push!(types, Pauli{N})
-    push!(types, PauliSum{N, ComplexF64})
+    push!(types, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     push!(types, DyadBasis{N})
     push!(types, Dyad{N})
-    push!(types, DyadSum{N, ComplexF64})
+    push!(types, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
 
     for T1 in types
         for T2 in types
@@ -40,10 +40,10 @@ end
     types2 = []
     push!(types1, PauliBasis{N})
     push!(types1, Pauli{N})
-    # push!(types1, PauliSum{N, ComplexF64})
+    # push!(types1, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     # push!(types1, DyadBasis{N})
     # push!(types1, Dyad{N})
-    # push!(types1, DyadSum{N, ComplexF64})
+    # push!(types1, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
     # push!(types2, Ket{N})
     push!(types2, KetSum{N})
 
@@ -70,10 +70,10 @@ end
     types = []
     push!(types, PauliBasis{N})
     push!(types, Pauli{N})
-    push!(types, PauliSum{N, ComplexF64})
+    push!(types, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     push!(types, DyadBasis{N})
     push!(types, Dyad{N})
-    push!(types, DyadSum{N, ComplexF64})
+    push!(types, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
 
     for T1 in types
         for T2 in types
@@ -98,10 +98,10 @@ end
     types = []
     push!(types, PauliBasis{N})
     push!(types, Pauli{N})
-    push!(types, PauliSum{N, ComplexF64})
+    push!(types, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     push!(types, DyadBasis{N})
     push!(types, Dyad{N})
-    push!(types, DyadSum{N, ComplexF64})
+    push!(types, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
 
     for T1 in types
         for T2 in types
@@ -126,10 +126,10 @@ end
     types = []
     push!(types, PauliBasis{N})
     push!(types, Pauli{N})
-    push!(types, PauliSum{N, ComplexF64})
+    push!(types, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     push!(types, DyadBasis{N})
     push!(types, Dyad{N})
-    push!(types, DyadSum{N, ComplexF64})
+    push!(types, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
 
     for T1 in types
         for T2 in types
@@ -154,10 +154,10 @@ end
     types = []
     push!(types, PauliBasis{N})
     push!(types, Pauli{N})
-    push!(types, PauliSum{N, ComplexF64})
+    push!(types, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     push!(types, DyadBasis{N})
     push!(types, Dyad{N})
-    push!(types, DyadSum{N, ComplexF64})
+    push!(types, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
 
     for T1 in types
         for i in 1:10
@@ -185,10 +185,10 @@ end
     types = []
     push!(types, PauliBasis{N})
     push!(types, Pauli{N})
-    push!(types, PauliSum{N, ComplexF64})
+    push!(types, PauliSum{N, PauliOperators.word_type(N), ComplexF64})
     push!(types, DyadBasis{N})
     push!(types, Dyad{N})
-    push!(types, DyadSum{N, ComplexF64})
+    push!(types, DyadSum{N, PauliOperators.word_type(N), ComplexF64})
 
     for T1 in types
         for i in 1:10
@@ -217,19 +217,79 @@ end
     @test norm(Vector(a/3.4) - Vector(a)/3.4) < 1e-15
 end
 
+@testset "Multiplication PauliSum-KetSum" begin
+    Random.seed!(1)
+
+    N = 4
+    for i in 1:10
+        O = rand(PauliSum{N, PauliOperators.word_type(N), ComplexF64}, n_paulis=10)
+        v = rand(KetSum{N}, n_terms=5)
+
+        σ = O*v
+        @test σ isa KetSum{N, PauliOperators.word_type(N), ComplexF64}
+        @test norm(Matrix(O)*Vector(v) - Vector(σ)) < 1e-14
+
+        # SparsePauliVector goes through the same AnyPauliSum method
+        Os = SparsePauliVector(O)
+        @test norm(Vector(Os*v) - Vector(σ)) < 1e-14
+
+        # matrix_element(KetSum, AnyPauliSum, KetSum) computes ⟨b|O|k⟩ via O*k
+        b = rand(KetSum{N}, n_terms=5)
+        me = matrix_element(b, O, v)
+        @test abs(Vector(b)'*Matrix(O)*Vector(v) - me) < 1e-13
+    end
+end
+
+@testset "Multiplication Y-phase promotion" begin
+    # Regression: real-valued inputs with an odd number of Y's used to throw
+    # InexactError because outputs were built as Float64 KetSums; the ±im
+    # phase must promote the output to complex.
+    N = 2
+    W = PauliOperators.word_type(N)
+
+    # PauliSum{...,Float64} * Ket
+    O = PauliSum(N, Float64)
+    O[PauliBasis("YI")] = 1.0
+    σ = O * Ket(N, 0)
+    @test σ isa KetSum{N, W, ComplexF64}
+    @test σ[Ket(N, 1)] ≈ 1.0im
+
+    # complex-valued PauliSum * Ket hit the same path
+    Oc = PauliSum(N, ComplexF64)
+    Oc[PauliBasis("YI")] = 1.0 + 0im
+    @test (Oc * Ket(N, 0))[Ket(N, 1)] ≈ 1.0im
+
+    # Pauli * Float64 KetSum and PauliBasis * Float64 KetSum
+    ks = KetSum(N)
+    ks[Ket(N, 0)] = 1.0
+    @test (Pauli("YI") * ks)[Ket(N, 1)] ≈ 1.0im
+    @test (PauliBasis("YI") * ks)[Ket(N, 1)] ≈ 1.0im
+
+    # dense cross-check on a Y-rich random operator applied to a Ket
+    Random.seed!(7)
+    Or = PauliSum(N, Float64)
+    while length(Or) < 8
+        Or[PauliBasis{N,W}(rand(W) & 0x3, rand(W) & 0x3)] = randn()
+    end
+    k = Ket(N, 2)
+    σr = Or * k
+    kv = zeros(ComplexF64, 2^N); kv[k.v+1] = 1
+    @test norm(Matrix(Or)*kv - Vector(σr)) < 1e-14
+end
+
 @testset "inner product" begin
     Random.seed!(1)
   
     N  = 5
 
     for i in 1:10
-        a = rand(PauliSum{N, ComplexF64}, n_paulis=10)
-        b = rand(PauliSum{N, ComplexF64}, n_paulis=12)
+        a = rand(PauliSum{N, PauliOperators.word_type(N), ComplexF64}, n_paulis=10)
+        b = rand(PauliSum{N, PauliOperators.word_type(N), ComplexF64}, n_paulis=12)
         err = tr(Matrix(a)'*Matrix(b))/2^N - inner_product(a,b)
         @test abs(err) < 1e-12
         
-        a = rand(KetSum{N, ComplexF64}, n_terms=10)
-        b = rand(KetSum{N, ComplexF64}, n_terms=12)
+        a = rand(KetSum{N, PauliOperators.word_type(N), ComplexF64}, n_terms=10)
+        b = rand(KetSum{N, PauliOperators.word_type(N), ComplexF64}, n_terms=12)
         err = Vector(a)'*Vector(b) - inner_product(a,b)
         @test abs(err) < 1e-12
     end

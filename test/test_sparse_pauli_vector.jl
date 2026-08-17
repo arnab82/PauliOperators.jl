@@ -2,25 +2,32 @@ using PauliOperators
 using LinearAlgebra
 using Test
 using Random
-using BitIntegers
 using PauliOperators: check_spv, _word_type, _pack, _unpack
 
 @testset "SparsePauliVector core" begin
     Random.seed!(2)
 
     @testset "word type selection" begin
-        @test _word_type(1) == UInt8
+        @test _word_type(1) == UInt64
         @test _word_type(64) == UInt64
         @test _word_type(65) == UInt128
         @test _word_type(128) == UInt128
-        @test _word_type(129) == BitIntegers.UInt256
+        @test _word_type(129) == PauliOperators.UInt256
+        @test _word_type(256) == PauliOperators.UInt256
+        @test _word_type(257) == PauliOperators.UInt512
+        @test _word_type(512) == PauliOperators.UInt512
+        @test _word_type(513) == PauliOperators.UInt1024
+        @test _word_type(1024) == PauliOperators.UInt1024
+        @test_throws ArgumentError _word_type(1025)
+        @test_throws ArgumentError _word_type(0)
 
         v = SparsePauliVector(4)
-        @test v isa SparsePauliVector{4, UInt8, ComplexF64}
+        @test v isa SparsePauliVector{4, UInt64, ComplexF64}
         v = SparsePauliVector(70, Float64)
         @test v isa SparsePauliVector{70, UInt128, Float64}
-        v = SparsePauliVector(129)
-        @test v isa SparsePauliVector{129, BitIntegers.UInt256, ComplexF64}
+        v = SparsePauliVector(200)
+        @test v isa SparsePauliVector{200, PauliOperators.UInt256, ComplexF64}
+        @test_throws ArgumentError SparsePauliVector(1025)
     end
 
     @testset "pack/unpack round-trip incl. sign bit" begin
@@ -32,8 +39,8 @@ using PauliOperators: check_spv, _word_type, _pack, _unpack
                 @test _unpack(PauliBasis{N}, z, x) == p
             end
         end
-        # N=128 with the high bit set
-        p = PauliBasis{128}(typemax(UInt128), typemax(UInt128))
+        # N=128 with the Int128 sign bit set
+        p = PauliBasis{128}(Int128(-1), Int128(-1))   # all 128 bits on
         z, x = _pack(UInt128, p)
         @test z == typemax(UInt128)
         @test _unpack(PauliBasis{128}, z, x) == p
@@ -53,7 +60,7 @@ using PauliOperators: check_spv, _word_type, _pack, _unpack
             ps[PauliBasis(rand(Pauli{6}))] = rand() - 0.5
         end
         v = SparsePauliVector(ps; T=Float64)
-        @test v isa SparsePauliVector{6, UInt8, Float64}
+        @test v isa SparsePauliVector{6, UInt64, Float64}
         @test PauliSum(v) == ps
         # real-T rejection of complex coefficients
         psc = PauliSum(6)
@@ -61,9 +68,9 @@ using PauliOperators: check_spv, _word_type, _pack, _unpack
         @test_throws ErrorException SparsePauliVector(psc; T=Float64)
         # convert() both ways
         ps = rand(PauliSum{5}; n_paulis=10)
-        v = convert(SparsePauliVector{5, _word_type(5), ComplexF64}, ps)
+        v = convert(SparsePauliVector{5, UInt64, ComplexF64}, ps)
         @test PauliSum(v) == ps
-        @test convert(PauliSum{5, ComplexF64}, v) == ps
+        @test convert(PauliSum{5, UInt64, ComplexF64}, v) == ps
     end
 
     @testset "Dict-idiom parity" begin
@@ -172,7 +179,7 @@ using PauliOperators: check_spv, _word_type, _pack, _unpack
         @test v[PauliBasis(pl)] == coeff(pl)
 
         v = rand(SparsePauliVector{7}; n_paulis=5)
-        @test v isa SparsePauliVector{7, UInt8, ComplexF64}
+        @test v isa SparsePauliVector{7, UInt64, ComplexF64}
         @test 1 <= length(v) <= 5
         @test check_spv(v)
         v = rand(SparsePauliVector{7, UInt64, ComplexF64}; n_paulis=5)

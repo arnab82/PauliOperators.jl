@@ -21,6 +21,30 @@ function variance(O::AnyPauliSum{N}, ψ::Ket{N}) where N
     return real(e2 - e1 * e1)
 end
 
+# SparsePauliVector specialization: the live buffer is x-major sorted, and
+# terms sharing an x-string map ψ to the same target ket — so the KetSum
+# dict of the generic method above collapses to one running sum per
+# contiguous x-run. Single ordered pass, allocation-free.
+function variance(v::SparsePauliVector{N,W,T}, ψ::Ket{N}) where {N,W,T}
+    v.an == 0 ||
+        error("variance on a SparsePauliVector with pending appends; merge first")
+    kv = (ψ.v % UInt128) % W
+    e2 = 0.0
+    e1 = zero(ComplexF64)
+    i = 1
+    @inbounds while i <= v.n
+        x = v.x[i]
+        run = zero(ComplexF64)
+        while i <= v.n && v.x[i] == x
+            run += _ket_phase(v.z[i], x, kv) * v.c[i]
+            i += 1
+        end
+        e2 += abs2(run)
+        x == zero(W) && (e1 = run)
+    end
+    return real(e2 - e1 * e1)
+end
+
 """
     covariance(A::PauliSum{N}, B::PauliSum{N}, ψ::Ket{N}) where N
 

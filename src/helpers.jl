@@ -1,44 +1,9 @@
 """
-    uinttype(N::Integer)
+    get_on_bits(x::Integer)
 
-Smallest unsigned integer type able to hold the `N`-bit symplectic `z`/`x`
-bitstrings of an `N`-qubit Pauli. Native `UInt8..UInt128` up to 128 bits, then
-`BitIntegers` fixed-width unsigned integers (`UInt256`, `UInt512`, `UInt1024`, ...)
-beyond — so Paulis on more than 128 qubits are supported (e.g. a 10x10x10 lattice
-uses `UInt1024`). Widths above 1024 are defined on demand.
+Return the (1-based) positions of the set bits of `x`, in increasing order.
+Used to translate `z`/`x` bitstrings into site indices, e.g. for display.
 """
-function uinttype(N::Integer)
-    N >= 0 || throw(DomainError(N, "N must be non-negative"))
-    N <= 8 && return UInt8
-    bits = nextpow(2, N)
-    bits <= 128 && return getfield(Base, Symbol("UInt", bits))
-    bits > 1024 && _define_wide_uint(bits)
-    return getfield(BitIntegers, Symbol("UInt", bits))
-end
-
-function _define_wide_uint(bits::Integer)
-    @eval BitIntegers begin
-        BitIntegers.@define_integers $bits
-    end
-    return nothing
-end
-
-# ---- shared threading helpers (used by threaded PauliSum reductions/rotations) ----
-
-# Split 1:n into k contiguous ranges (trailing ranges may be empty if k > n).
-function chunk_ranges(n::Integer, k::Integer)
-    sz = cld(n, k)
-    return [((c-1)*sz + 1):min(c*sz, n) for c in 1:k]
-end
-
-# Number of threads to use for a term-wise reduction/loop over `n` Pauli terms.
-# Returns 1 (serial) unless there are enough terms to amortize the thread overhead.
-function reduction_nthreads(n::Integer; min_per_thread::Integer=4096)
-    nt = Threads.nthreads()
-    (nt > 1 && n >= 2*min_per_thread) || return 1
-    return min(nt, max(1, cld(n, min_per_thread)))
-end
-
 function get_on_bits(x::T) where T<:Integer
     N = count_ones(x)
     inds = Vector{Int}(undef, N)
@@ -47,7 +12,7 @@ function get_on_bits(x::T) where T<:Integer
     end
 
     count = 1
-    for i in 1:length(bitstring(x))
+    for i in 1:8*sizeof(x)
         if x >> (i-1) & 1 == 1
             inds[count] = i
             count += 1
@@ -55,5 +20,22 @@ function get_on_bits(x::T) where T<:Integer
         count <= N || break
     end
     return inds
+end
+
+# Branchless-suffix-parity Majorana weight on packed words; the word-level
+# kernel behind `majorana_weight` (see clip.jl for the derivation). The
+# shift cascade covers 8*sizeof(W) bits, so it is correct at every word
+# width including the BitIntegers.jl types.
+@inline function _majorana_weight_bits(z::W, x::W) where {W<:Unsigned}
+    zonly = z & ~x
+    S = x
+    shift = 1
+    while shift < 8 * sizeof(W)
+        S ⊻= S >> shift
+        shift <<= 1
+    end
+    ctrl = ~(S ⊻ x)
+    return count_ones(x) + 2 * count_ones(zonly & ctrl) +
+           2 * count_ones(~(z | x) & ~ctrl)
 end
 

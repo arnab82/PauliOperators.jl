@@ -74,21 +74,6 @@ end
         end
     end
 
-    @testset "threaded sequence parity at window=1" begin
-        O0 = rand(PauliSum{N}; n_paulis=120)
-        gens = PauliBasis{N}[PauliBasis(rand(Pauli{N})) for _ in 1:14]
-        angs = [0.02 * randn() for _ in eachindex(gens)]
-
-        for strat in (NoTruncation(), CoeffTruncation(1e-7), WeightTruncation(5))
-            serial = SparsePauliVector(O0)
-            threaded = SparsePauliVector(O0)
-            evolve!(serial, gens, angs; window=1, truncation=strat, threaded=false)
-            evolve!(threaded, gens, angs; window=1, truncation=strat, threaded=true)
-            @test isapprox(serial, threaded; atol=1e-12)
-            @test PauliOperators.check_spv(threaded)
-        end
-    end
-
     @testset "correction parity at window=1" begin
         H = _heisenberg_chain(N)
         gens, angs = trotterize(H, 0.05, n_trotter=2, order=2)

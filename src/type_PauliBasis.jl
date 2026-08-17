@@ -1,7 +1,7 @@
 
 """
-    z::T
-    x::T
+    z::W
+    x::W
 
 A positive, Hermitian Pauli, used as a basis for more general `Pauli`'s (which can have a complex phase).
 These are primarily used to provide a basis for linear combinations of Paulis, e.g., `PauliSum`'s.
@@ -9,26 +9,44 @@ These are primarily used to provide a basis for linear combinations of Paulis, e
     PauliBasis{N}(z,x)  =  i^θs ⋅ z₁...|x₁...
                             =  P₁⊗...⊗Pₙ
 
-The bitstrings `z`, `x` are stored as an unsigned integer of type `T`. `T` defaults to
-`uinttype(N)`, the smallest unsigned type able to hold `N` bits, which uses `BitIntegers`
-fixed-width integers for `N > 128` (so e.g. a 10x10x10 lattice is `PauliBasis{1000,UInt1024}`).
+The bitstrings are stored in an unsigned word `W` sized to `N` by
+`word_type(N)` (`UInt64` up to 64 qubits, ..., `UInt1024` up to 1024).
+`W` never needs to be written explicitly: `PauliBasis{N}(z, x)` infers it.
 
 Phase definitions:
 - `symplectic_phase`: `θs` - phase needed to cancel the phase arising from the ZX factorized form: `θs = θ-θg`
 """
-struct PauliBasis{N,T<:Unsigned}
-    z::T
-    x::T
+struct PauliBasis{N, W<:Unsigned}
+    z::W
+    x::W
 
-    PauliBasis{N,T}(z::T, x::T) where {N,T<:Unsigned} = new{N,T}(z, x)
+    function PauliBasis{N,W}(z::W, x::W) where {N, W<:Unsigned}
+        8 * sizeof(W) >= N || throw(ArgumentError("$W is too narrow for N=$N"))
+        return new{N,W}(z, x)
+    end
 end
 
-PauliBasis{N,T}(z::Integer, x::Integer) where {N,T<:Unsigned} = PauliBasis{N,T}(T(z), T(x))
-PauliBasis{N}(z::Integer, x::Integer) where {N} = PauliBasis{N,uinttype(N)}(z, x)
+# Hot path: W inferred from the arguments, no masking (caller invariant).
+PauliBasis{N}(z::W, x::W) where {N, W<:Unsigned} = PauliBasis{N,W}(z, x)
+
+# Convenience paths: any Integer (negative values are two's-complement
+# reinterpreted), masked to the low N bits, canonical W.
+PauliBasis{N}(z::Integer, x::Integer) where {N} =
+    (W = word_type(N); PauliBasis{N,W}(_to_word(W, N, z), _to_word(W, N, x)))
+PauliBasis{N,W}(z::Integer, x::Integer) where {N, W<:Unsigned} =
+    PauliBasis{N,W}(_to_word(W, N, z), _to_word(W, N, x))
 
 LinearAlgebra.ishermitian(p::PauliBasis) = true
 coeff(p::PauliBasis) = 1
 
+"""
+    symplectic_phase(p::Union{Pauli{N}, PauliBasis{N}})
+
+The power of `i` needed to recover the Hermitian Pauli string from the bare
+ZX bitstring form: `P = i^θs ⋅ (z|x)`, with `θs = (-n_Y) mod 4` where `n_Y`
+is the number of Y sites (`count_ones(z & x)`). Arises because each Y site
+is stored as `ZX = iY`.
+"""
 @inline symplectic_phase(p::PauliBasis) = (4-count_ones(p.z & p.x)%4)%4
 
 function PauliBasis(str::String)
@@ -37,22 +55,21 @@ function PauliBasis(str::String)
     end
 
     N = length(str)
-    T = uinttype(N)
-    x = zero(T)
-    z = zero(T)
-    two = T(2)
-    one_ = T(1)
+    W = word_type(N)
+    x = zero(W)
+    z = zero(W)
+    idx = 0
 
-    for (i0, i) in enumerate(str)
-        idx = T(i0)
+    for i in str
         if i in ['X', 'Y']
-            x |= two^(idx-one_)
+            x |= one(W) << idx
         end
         if i in ['Z', 'Y']
-            z |= two^(idx-one_)
+            z |= one(W) << idx
         end
+        idx += 1
     end
-    return PauliBasis{N,T}(z, x)
+    return PauliBasis{N}(z, x)
 end
 
 
@@ -112,27 +129,19 @@ function Base.string(p::PauliBasis{N}) where N
 end
 
 function Base.rand(::Type{PauliBasis{N}}) where N
-    return rand(PauliBasis{N,uinttype(N)})
+    W = word_type(N)
+    m = _nbit_mask(W, N)
+    return PauliBasis{N,W}(rand(W) & m, rand(W) & m)
 end
-function Base.rand(::Type{PauliBasis{N,T}}) where {N,T<:Unsigned}
-    mask = _bitmask(T, N)
-    return PauliBasis{N,T}(rand(T) & mask, rand(T) & mask)
-end
-
-# Lowest-N-bits mask for an unsigned type T (handles N == bitwidth(T)).
-@inline function _bitmask(::Type{T}, N::Integer) where {T<:Unsigned}
-    N >= sizeof(T) * 8 && return ~zero(T)
-    return (one(T) << N) - one(T)
-end
+Base.rand(::Type{PauliBasis{N,W}}) where {N, W<:Unsigned} =
+    (m = _nbit_mask(W, N); PauliBasis{N,W}(rand(W) & m, rand(W) & m))
 
 
 Base.show(io::IO, p::PauliBasis{N}) where N = print(io, string(p))
 
 function otimes(p1::PauliBasis{N}, p2::PauliBasis{M}) where {N,M}
-    T = uinttype(N+M)
-    z = T(p1.z) | (T(p2.z) << N)
-    x = T(p1.x) | (T(p2.x) << N)
-    PauliBasis{N+M,T}(z, x)
+    W = word_type(N + M)
+    PauliBasis{N+M,W}(W(p1.z) | W(p2.z) << N, W(p1.x) | W(p2.x) << N)
 end
 
 Base.:*(p1::PauliBasis, p2::PauliBasis) = Pauli(p1) * Pauli(p2)
@@ -144,7 +153,13 @@ Base.adjoint(p::PauliBasis) = p
 function Base.iterate(::Type{PauliBasis{N}}, state = 1) where N
     state > 4^N && return
     next = CartesianIndices((2^N,2^N))[state]
-    return PauliBasis{N}(next[1]-1, next[2]-1), state+1
+    return PauliBasis{N}(next[1]-1, next[2]-1), state+1 
 end
+ 
+"""
+    commute(p1::PauliBasis, p2::PauliBasis)
 
+Return `true` if the two Pauli strings commute, via the symplectic parity
+test `popcount(x₁ & z₂) ≡ popcount(z₁ & x₂) (mod 2)` — no product is formed.
+"""
 @inline commute(p1::PauliBasis, p2::PauliBasis) = iseven(count_ones(p1.x & p2.z) - count_ones(p1.z & p2.x))

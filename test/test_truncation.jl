@@ -354,4 +354,115 @@ using Random
         @test CompositeTruncation([NoTruncation(), CoeffTruncation(0.1)]).strategies isa Tuple
     end
 
+    # The SPV run sinks (EnergyDropSink / XRunDelta) accumulate the exact
+    # correction inside the x-major kernel walk. Three independent answers
+    # must agree: measured before/after (ground truth for pure drops), the
+    # Dict TruncationDelta route, and the SPV run-sink route.
+    #
+    # Swept across every storage word: the correction route keys ket bits by
+    # the register's own `W`, so UInt64/UInt128/UInt256 must all be exact.
+    # An Int128-keyed implementation passes at N = 8 and silently mis-attributes
+    # drops on qubits >= 128, which is why the sweep goes past the boundary.
+    @testset "SPV run-sink corrections: exact parity" begin
+        for (N, W) in ((8, UInt64), (70, UInt128),
+                       (130, PauliOperators.UInt256), (200, PauliOperators.UInt256))
+            @testset "N=$N ($W)" begin
+                Random.seed!(1234 + N)
+                @test PauliOperators.word_type(N) === W
+                for trial in 1:3
+                    ψ = rand(Ket{N})
+                    @test ψ isa Ket{N,W}
+                    ps = PauliSum(N, ComplexF64)
+                    for _ in 1:400
+                        p = rand(PauliBasis{N})
+                        ps[p] = get(ps, p, 0.0 + 0im) + (2 * rand() - 1) * 0.3
+                    end
+                    thresh = 0.1
+
+                    e0 = real(expectation_value(ps, ψ))
+                    v0 = variance(ps, ψ)
+                    psc = deepcopy(ps)
+                    truncate!(psc, CoeffTruncation(thresh))
+                    de_true = real(expectation_value(psc, ψ)) - e0
+                    dv_true = variance(psc, ψ) - v0
+                    @test abs(dv_true) > 0    # the clip must actually bite
+
+                    c_dict = EnergyVarianceCorrection(ψ)
+                    ps1 = deepcopy(ps)
+                    truncate!(ps1, CoeffTruncation(thresh), c_dict)
+
+                    c_spv = EnergyVarianceCorrection(ψ)
+                    v = SparsePauliVector(ps)
+                    truncate!(v, CoeffTruncation(thresh), c_spv)
+                    @test PauliOperators.check_spv(v)
+
+                    @test isapprox(c_dict.accumulated_energy, de_true; atol=1e-12)
+                    @test isapprox(c_spv.accumulated_energy, de_true; atol=1e-12)
+                    @test isapprox(c_dict.accumulated_variance, dv_true; atol=1e-10)
+                    @test isapprox(c_spv.accumulated_variance, dv_true; atol=1e-10)
+                    @test isapprox(c_spv.accumulated_variance, c_dict.accumulated_variance;
+                                   atol=1e-12)
+
+                    cE = EnergyCorrection(ψ)
+                    v2 = SparsePauliVector(ps)
+                    truncate!(v2, CoeffTruncation(thresh), cE)
+                    @test isapprox(cE.accumulated_energy, de_true; atol=1e-12)
+
+                    # x-run variance specialization against the generic KetSum route
+                    @test isapprox(variance(v, ψ), variance(PauliSum(v), ψ); atol=1e-11)
+                end
+            end
+        end
+    end
+
+    # Sharp regression for the word-narrowing bug: a dropped term living
+    # ENTIRELY on qubits >= 128 is invisible to an Int128-keyed correction
+    # (its z/x words truncate to 0), so the delta gets attributed to the
+    # identity ket and both accumulators come out wrong. Also covers the
+    # weight path: `should_drop` must see the native word, or a high-qubit
+    # term's weight is undercounted and it survives a WeightTruncation.
+    @testset "corrections and weights on qubits >= 128" begin
+        N = 200                                # UInt256 storage
+        ψ = Ket(N, 0)
+        for hi in (129, 150, N)                # all beyond the Int128 window
+            ps = PauliSum(N, ComplexF64)
+            ps[PauliBasis(Pauli(N))]           = 1.0 + 0im   # identity
+            ps[PauliBasis(Pauli(N, Z = [1]))]  = 0.5 + 0im
+            ps[PauliBasis(Pauli(N, X = [hi]))] = 0.01 + 0im  # dropped, high qubit
+
+            e0 = real(expectation_value(ps, ψ))
+            v0 = variance(ps, ψ)
+            psc = deepcopy(ps)
+            truncate!(psc, CoeffTruncation(0.1))
+            de_true = real(expectation_value(psc, ψ)) - e0
+            dv_true = variance(psc, ψ) - v0
+
+            corr = EnergyVarianceCorrection(ψ)
+            ps1 = deepcopy(ps)
+            truncate!(ps1, CoeffTruncation(0.1), corr)
+            @test isapprox(corr.accumulated_energy, de_true; atol = 1e-12)
+            @test isapprox(corr.accumulated_variance, dv_true; atol = 1e-10)
+
+            # SPV run-sink route must agree at the same width
+            cspv = EnergyVarianceCorrection(ψ)
+            truncate!(SparsePauliVector(ps), CoeffTruncation(0.1), cspv)
+            @test isapprox(cspv.accumulated_energy, de_true; atol = 1e-12)
+            @test isapprox(cspv.accumulated_variance, dv_true; atol = 1e-10)
+
+            # weight of a single high-qubit X is 1, so WeightTruncation(0)
+            # must drop it; a UInt128-narrowed word would score it 0 and keep it
+            pw = deepcopy(ps)
+            truncate!(pw, WeightTruncation(0), EnergyCorrection(ψ))
+            @test !haskey(pw, PauliBasis(Pauli(N, X = [hi])))
+            @test !haskey(pw, PauliBasis(Pauli(N, Z = [1])))
+            @test haskey(pw, PauliBasis(Pauli(N)))   # identity has weight 0
+        end
+
+        # a reference ket with bits set above 128 must survive the sink
+        ψhi = Ket{N}(PauliOperators.word_type(N)(1) << 150)
+        Δ = PauliOperators.TruncationDelta(ψhi)
+        @test Δ.ψv == ψhi.v
+        @test Δ.ψv >> 150 == 1
+    end
+
 end

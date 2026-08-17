@@ -1,27 +1,41 @@
 using PauliOperators
 using Documenter
+using Documenter.Remotes: GitHub
 
 DocMeta.setdocmeta!(PauliOperators, :DocTestSetup, :(using PauliOperators); recursive=true)
 
 makedocs(;
     modules=[PauliOperators],
     authors="Nick Mayhall",
-    repo="https://github.com/nmayhall-vt/PauliOperators.jl/blob/{commit}{path}#{line}",
+    repo=GitHub("nmayhall", "PauliOperators.jl"),
     sitename="PauliOperators.jl",
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://nmayhall-vt.github.io/PauliOperators.jl",
+        canonical="https://nmayhall.github.io/PauliOperators.jl",
         edit_link="main",
-        assets=String[],
+        assets=String["assets/favicon.ico"],
     ),
     pages=[
         "Home" => "index.md",
-        "Types" => "types.md",
-        "Funcitons" => "functions.md",
+        "Internals" => [
+            "Pauli Representation" => "representation.md",
+            "Data Structures & Performance" => "data_structures.md",
+            "Truncation" => "truncation.md",
+        ],
+        "Migration Guides" => [
+            "v3 → v4 (word types)" => "migration_v4.md",
+            "DBF.jl" => "migration_DBF.md",
+            "DissipativePauliGroundState.jl" => "migration_DissipativePauliGroundState.md",
+            "OpenSCI.jl" => "migration_OpenSCI.md",
+        ],
+        "Reference" => [
+            "Types" => "types.md",
+            "Functions" => "functions.md",
+        ],
     ],
 )
 
 deploydocs(;
-    repo="github.com/nmayhall-vt/PauliOperators.jl",
+    repo="github.com/nmayhall/PauliOperators.jl",
     devbranch="main",
 )

@@ -130,8 +130,8 @@ end
 appends — expectation is linear, so the pre-merge state evaluates exactly.
 Allocation-free.
 """
-expectation_value(v::SparsePauliVector{N,W,T}, ψ::Ket{N}) where {N,W,T} =
-    _expectation_spv(v, W(ψ.v))
+expectation_value(v::SparsePauliVector{N,W,T}, ψ::Ket{N,W}) where {N,W,T} =
+    _expectation_spv(v, ψ.v)
 
 # ------------------------------------------------------------
 # Windowed evolution driver
@@ -217,199 +217,6 @@ function _rotate_spv!(v::SparsePauliVector{N,W,T}, gz::W, gx::W, ng::Int,
     return cr1 + cr2, ov1 | ov2
 end
 
-# Threaded fast path for the common window=1 case. Each task owns a disjoint
-# range of live terms and a worst-case append slice, so coefficient scaling and
-# sin-branch writes are race-free. The append slices are compacted afterward in
-# chunk order, preserving the single-rotation order used by _unshuffle_ws!.
-function _rotate_spv_threaded_live!(v::SparsePauliVector{N,W,T},
-                                    gz::W, gx::W, ng::Int,
-                                    cosθ::Float64, sinθ::Float64,
-                                    f::MergeFilter,
-                                    nt::Int) where {N,W,T}
-    v.an == 0 || return _rotate_spv!(v, gz, gx, ng, cosθ, sinθ, f)
-    n = v.n
-    n == 0 && return 0, false
-    nt = min(nt, n)
-    nt <= 1 && return _rotate_spv!(v, gz, gx, ng, cosθ, sinθ, f)
-    n > length(v.az) && _grow_append!(v, n)
-
-    starts = Vector{Int}(undef, nt)
-    counts = Vector{Int}(undef, nt)
-    ranges = _spv_chunk_ranges(n, nt)
-    cur = 1
-    for t in 1:nt
-        starts[t] = cur
-        cur += length(ranges[t])
-    end
-
-    @sync for t in 1:nt
-        r = ranges[t]
-        start = starts[t]
-        Threads.@spawn let t=t, r=r, start=start
-            out = start - 1
-            made = 0
-            @inbounds for i in r
-                zi = v.z[i]
-                xi = v.x[i]
-                m1 = count_ones(gx & zi)
-                m2 = count_ones(gz & xi)
-                iseven(m1 - m2) && continue
-                zp = gz ⊻ zi
-                xp = gx ⊻ xi
-                k = (count_ones(zp & xp) - ng - count_ones(zi & xi) + 2 * m1) & 3
-                cnew = (T(k - 2) * sinθ) * v.c[i]
-                v.c[i] *= cosθ
-                should_drop(f, zp, xp, abs(cnew)) && continue
-                out += 1
-                v.az[out] = zp
-                v.ax[out] = xp
-                v.ac[out] = cnew
-                made += 1
-            end
-            counts[t] = made
-        end
-    end
-
-    dest = 1
-    created = 0
-    @inbounds for t in 1:nt
-        m = counts[t]
-        src = starts[t]
-        if m > 0 && src != dest
-            copyto!(v.az, dest, v.az, src, m)
-            copyto!(v.ax, dest, v.ax, src, m)
-            copyto!(v.ac, dest, v.ac, src, m)
-        end
-        dest += m
-        created += m
-    end
-    v.an = created
-    return created, false
-end
-
-function _spv_chunk_ranges(n::Int, nt::Int)
-    sz = cld(n, nt)
-    return [((t - 1) * sz + 1):min(t * sz, n) for t in 1:nt]
-end
-
-function _lower_bound_ws(ws::Vector{Tuple{W,W,T}}, lo::Int, hi::Int,
-                         z::W, x::W) where {W,T}
-    l = lo
-    r = hi + 1
-    key = (z, x)
-    @inbounds while l < r
-        mid = (l + r) >>> 1
-        if _key_lt(ws[mid], key)
-            l = mid + 1
-        else
-            r = mid
-        end
-    end
-    return l
-end
-
-function _merge_spv_range!(z::Vector{W}, x::Vector{W}, c::Vector{T},
-                           alo::Int, ahi::Int,
-                           ws::Vector{Tuple{W,W,T}}, blo::Int, bhi::Int,
-                           sz::Vector{W}, sx::Vector{W}, sc::Vector{T},
-                           out_start::Int, f::MergeFilter) where {W,T}
-    out = out_start - 1
-    i = alo
-    j = blo
-    @inbounds while i <= ahi || j <= bhi
-        local kz::W, kx::W
-        local acc::T
-        if j > bhi || (i <= ahi && !_key_lt(ws[j], (z[i], x[i])))
-            kz = z[i]
-            kx = x[i]
-            acc = c[i]
-            i += 1
-        else
-            kz, kx, acc = ws[j]
-            j += 1
-        end
-        while j <= bhi && _key_eq(ws[j], (kz, kx))
-            acc += ws[j][3]
-            j += 1
-        end
-        should_drop(f, kz, kx, abs(acc)) && continue
-        out += 1
-        sz[out] = kz
-        sx[out] = kx
-        sc[out] = acc
-    end
-    return out - out_start + 1
-end
-
-function _merge_spv_threaded!(v::SparsePauliVector{N,W,T}, m::Int,
-                              f::MergeFilter, nt::Int) where {N,W,T}
-    n = v.n
-    n == 0 && return _merge_spv!(v, m, f)
-    m == 0 && return _merge_spv!(v, m, f)
-    nt = min(nt, n)
-    nt <= 1 && return _merge_spv!(v, m, f)
-    n + m > length(v.sz) && _grow_live!(v, n + m)
-
-    ranges = _spv_chunk_ranges(n, nt)
-    bstarts = Vector{Int}(undef, nt)
-    bends = Vector{Int}(undef, nt)
-    outstarts = Vector{Int}(undef, nt)
-    counts = Vector{Int}(undef, nt)
-
-    maxout = 1
-    @inbounds for t in 1:nt
-        r = ranges[t]
-        if t == 1
-            bstarts[t] = 1
-        else
-            bstarts[t] = bends[t - 1] + 1
-        end
-        if t == nt
-            bends[t] = m
-        else
-            nxt = last(r) + 1
-            bends[t] = _lower_bound_ws(v.ws, 1, m, v.z[nxt], v.x[nxt]) - 1
-        end
-        outstarts[t] = maxout
-        maxout += length(r) + max(0, bends[t] - bstarts[t] + 1)
-    end
-    maxout - 1 > length(v.sz) && _grow_live!(v, maxout - 1)
-
-    Threads.@threads :static for t in 1:nt
-        r = ranges[t]
-        blo = bstarts[t]
-        bhi = bends[t]
-        out = outstarts[t]
-        counts[t] = _merge_spv_range!(v.z, v.x, v.c, first(r), last(r),
-                                      v.ws, blo, bhi, v.sz, v.sx, v.sc,
-                                      out, f)
-    end
-
-    out = 0
-    @inbounds for t in 1:nt
-        cnt = counts[t]
-        src = outstarts[t]
-        for i in 0:cnt-1
-            v.ws[out + i + 1] = (v.sz[src + i], v.sx[src + i], v.sc[src + i])
-        end
-        out += cnt
-    end
-    @inbounds for i in 1:out
-        v.sz[i], v.sx[i], v.sc[i] = v.ws[i]
-    end
-    v.z, v.sz = v.sz, v.z
-    v.x, v.sx = v.sx, v.x
-    v.c, v.sc = v.sc, v.c
-    v.n = out
-    v.an = 0
-    return n + m, out
-end
-
-const _SPV_THREADED_ROTATE_MIN = 24_000
-const _SPV_THREADED_MERGE_MIN = typemax(Int)
-_use_threaded_merge(v::SparsePauliVector, m::Int, threaded::Bool) =
-    threaded && v.n + m >= _SPV_THREADED_MERGE_MIN
-
 """
     evolve!(O::SparsePauliVector{N}, G::PauliBasis{N}, θ::Real)
 
@@ -445,35 +252,48 @@ _needs_merged_measure(::NoCorrection) = false
 _needs_merged_measure(::EnergyCorrection) = false
 _needs_merged_measure(::CorrectionAccumulator) = true
 
-# Window/early boundary: measure → merge (strict filter) → generic _apply!
-# for non-compilable strategies → measure → accumulate. Corrections capture
-# exactly the truncation loss.
+# Window/early boundary. Three routes:
+#  1. Built-in accumulators + compilable strategy (the production hot path):
+#     single strict-filter merge with a run sink (EnergyDropSink/XRunDelta,
+#     see truncation.jl) accumulating the exact correction inside the merge
+#     walk itself — no full before/after measurements, no dict, no second
+#     sweep over the kept terms.
+#  2. Other corrections needing merged measurement (`_needs_merged_measure`):
+#     unfiltered merge → measure → truncate → measure → accumulate.
+#  3. NoCorrection / linear-on-pre-merge: measure → strict merge → apply →
+#     measure → accumulate.
+# NOTE (all routes): drops by the LOCAL filter inside _rotate_range! are not
+# observed by corrections; correction-tracked runs should keep
+# local_truncation = NoTruncation (the default).
 function _boundary!(O::SparsePauliVector{N,W}, f::MergeFilter, strategy::S,
                     compiled::Bool, correction::CorrectionAccumulator,
                     counters::Union{Nothing,WindowCounters},
                     w::Int,
-                    mask::Union{Nothing,Tuple{W,W}}=nothing,
-                    threaded::Bool=false) where {N,W,S<:TruncationStrategy}
+                    mask::Union{Nothing,Tuple{W,W}}=nothing) where {N,W,S<:TruncationStrategy}
     local before, n_in, n_out
-    if _needs_merged_measure(correction)
+    if correction isa Union{EnergyCorrection,EnergyVarianceCorrection} && compiled
+        Δ = _make_sink(correction, O)
         m = _gather_append!(O)
         _sort_pending!(O, m, mask)
-        n_in, n_out = _use_threaded_merge(O, m, threaded) ?
-            _merge_spv_threaded!(O, m, NOFILTER, Threads.nthreads()) :
-            _merge_spv!(O, m, NOFILTER)
+        n_in, n_out = _merge_spv!(O, m, f, Δ)
+        _finalize_delta!(correction, Δ, O)
+    elseif _needs_merged_measure(correction)
+        m = _gather_append!(O)
+        _sort_pending!(O, m, mask)
+        n_in, n_out = _merge_spv!(O, m, NOFILTER)
         before = _measure(O, correction)
         compiled ? _compact_spv!(O, f) : _apply!(O, strategy)
+        after = _measure(O, correction)
+        _accumulate!(correction, before, after)
     else
         before = _measure(O, correction)
         m = _gather_append!(O)
         _sort_pending!(O, m, mask)
-        n_in, n_out = _use_threaded_merge(O, m, threaded) ?
-            _merge_spv_threaded!(O, m, f, Threads.nthreads()) :
-            _merge_spv!(O, m, f)
+        n_in, n_out = _merge_spv!(O, m, f)
         compiled || _apply!(O, strategy)
+        after = _measure(O, correction)
+        _accumulate!(correction, before, after)
     end
-    after = _measure(O, correction)
-    _accumulate!(correction, before, after)
     if counters !== nothing
         counters.merge_in[w] += n_in
         counters.merge_out[w] += n_out
@@ -507,14 +327,13 @@ the buffer at the boundary if the population genuinely needs more room.
 The steady-state hot path allocates zero bytes — pass a `WindowCounters`
 to verify (`counters.allocd`).
 """
-function evolve!(O::SparsePauliVector{N,W,T}, generators::Vector{PauliBasis{N}},
+function evolve!(O::SparsePauliVector{N,W,T}, generators::Vector{PauliBasis{N,W}},
                  angles::Vector{<:Real};
                  window::Int=1,
                  truncation::TruncationStrategy=NoTruncation(),
                  local_truncation::TruncationStrategy=NoTruncation(),
                  correction::CorrectionAccumulator=NoCorrection(),
-                 counters::Union{Nothing,WindowCounters}=nothing,
-                 threaded::Bool=false) where {N,W,T}
+                 counters::Union{Nothing,WindowCounters}=nothing) where {N,W,T}
     length(generators) == length(angles) ||
         throw(DimensionMismatch("generators and angles must have same length"))
     window >= 1 || throw(ArgumentError("window must be >= 1"))
@@ -527,7 +346,6 @@ function evolve!(O::SparsePauliVector{N,W,T}, generators::Vector{PauliBasis{N}},
         throw(ArgumentError("local_truncation must be a deterministic " *
                             "(weight/coefficient) strategy — it runs per append"))
     flocal = _compile_filter(local_truncation)
-    can_thread = threaded && Threads.nthreads() > 1 && window == 1
 
     # Setup allocations (packed generators), outside the gc_num baseline.
     gz = Vector{W}(undef, L)
@@ -555,17 +373,13 @@ function evolve!(O::SparsePauliVector{N,W,T}, generators::Vector{PauliBasis{N}},
         # and appends one sin branch.
         if 2 * O.an + O.n > length(O.az)
             _boundary!(O, f, truncation, compiled, correction, counters, w,
-                       since == 1 ? (lz, lx) : nothing, can_thread)
+                       since == 1 ? (lz, lx) : nothing)
             since = 0
             counters === nothing || (counters.early_merges[w] += 1)
             O.n > length(O.az) && _grow_append!(O, O.n)
         end
         t0 = time_ns()
-        thread_rotation = can_thread
-        created, ovf = thread_rotation ?
-            _rotate_spv_threaded_live!(O, gz[i], gx[i], ng[i], cosv[i], sinv[i],
-                                       flocal, Threads.nthreads()) :
-            _rotate_spv!(O, gz[i], gx[i], ng[i], cosv[i], sinv[i], flocal)
+        created, ovf = _rotate_spv!(O, gz[i], gx[i], ng[i], cosv[i], sinv[i], flocal)
         ovf && error("append overflow despite precheck (rotation $i) — this is a bug")
         lz = gz[i]
         lx = gx[i]
@@ -577,7 +391,7 @@ function evolve!(O::SparsePauliVector{N,W,T}, generators::Vector{PauliBasis{N}},
         if i % window == 0 || i == L
             t1 = time_ns()
             _boundary!(O, f, truncation, compiled, correction, counters, w,
-                       since == 1 ? (lz, lx) : nothing, can_thread)
+                       since == 1 ? (lz, lx) : nothing)
             since = 0
             if counters !== nothing
                 counters.t_merge[w] += (time_ns() - t1) / 1e9
@@ -595,6 +409,6 @@ end
 
 Non-mutating sequence evolution (see `evolve!`).
 """
-evolve(O::SparsePauliVector{N}, generators::Vector{PauliBasis{N}},
-       angles::Vector{<:Real}; kwargs...) where {N} =
+evolve(O::SparsePauliVector{N,W}, generators::Vector{PauliBasis{N,W}},
+       angles::Vector{<:Real}; kwargs...) where {N,W} =
     evolve!(copy(O), generators, angles; kwargs...)

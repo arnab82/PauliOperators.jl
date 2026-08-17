@@ -26,21 +26,30 @@ const _DPS_STORE = Dict{Symbol,Any}()
 const _DPS_STAGE = Dict{Symbol,Any}()
 const _DPS_PENDING = Dict{Symbol,Any}()
 
+# Minimum shard population before an SPV rotation is worth splitting across
+# threads: below this the @spawn/@sync overhead and the per-thread staging
+# allocation dominate the actual rotation work.
+const _SPV_THREADED_ROTATE_MIN = 1 << 12
+
 """
-    DistributedPauliSum{N,T}
+    DistributedPauliSum{N,W,T}
 
 Metadata handle for an `N`-qubit Pauli sum whose terms are sharded across
 `workers`. The master holds only the id, worker list, and local storage kind; the
 coefficients live on the workers.
+
+`W` is the unsigned storage word of the underlying `PauliBasis{N,W}` (see
+[`word_type`](@ref)), so sharded operators carry the same width parameter as
+local ones and support N > 128 via BitIntegers words.
 """
-mutable struct DistributedPauliSum{N,T}
+mutable struct DistributedPauliSum{N,W<:Unsigned,T}
     id::Symbol
     workers::Vector{Int}
     storage::Symbol
 end
 
-DistributedPauliSum{N,T}(id::Symbol, workers::Vector{Int}) where {N,T} =
-    DistributedPauliSum{N,T}(id, workers, :dict)
+DistributedPauliSum{N,W,T}(id::Symbol, workers::Vector{Int}) where {N,W<:Unsigned,T} =
+    DistributedPauliSum{N,W,T}(id, workers, :dict)
 
 # Which worker owns a given Pauli basis (stable hash partition).
 @inline function _pauli_owner(pb, workers)
@@ -89,10 +98,10 @@ _dps_storage(storage) = _dps_storage_alias(storage)
 _dps_default_storage(::PauliSum) = :dict
 _dps_default_storage(::SparsePauliVector) = :spv
 
-function _dps_materialize_bucket(bucket::PauliSum{N,T}, storage::Symbol;
+function _dps_materialize_bucket(bucket::PauliSum{N,W,T}, storage::Symbol;
                                  capacity_factor::Real=2.0,
                                  append_factor::Real=1.0,
-                                 min_capacity::Int=16) where {N,T}
+                                 min_capacity::Int=16) where {N,W,T}
     storage == :dict && return bucket
     return SparsePauliVector(bucket; T=T, capacity_factor=capacity_factor,
                              append_factor=append_factor, min_capacity=min_capacity)
@@ -145,9 +154,9 @@ stores each shard as a `SparsePauliVector`. When `storage` is omitted, the
 `PAULI_STORAGE` environment variable may select `dict` or `spv`; otherwise
 PauliSum inputs keep Dict shards and SparsePauliVector inputs keep SPV shards.
 """
-function distribute(O::AnyPauliSum{N,T}; workers=Distributed.workers(), id=nothing,
+function distribute(O::AnyPauliSum{N,W,T}; workers=Distributed.workers(), id=nothing,
                     storage=nothing, capacity_factor::Real=2.0,
-                    append_factor::Real=1.0, min_capacity::Int=16) where {N,T}
+                    append_factor::Real=1.0, min_capacity::Int=16) where {N,W,T}
     pids = ensure_pauli_workers!(workers=workers)
     store = pauli_storage(storage; default=_dps_default_storage(O))
     sid = id === nothing ? gensym(:dps) : Symbol(id)
@@ -168,7 +177,7 @@ function distribute(O::AnyPauliSum{N,T}; workers=Distributed.workers(), id=nothi
             end
         end
     end
-    return DistributedPauliSum{N,T}(sid, pids, store)
+    return DistributedPauliSum{N,W,T}(sid, pids, store)
 end
 
 """
@@ -187,7 +196,7 @@ Base.length(dO::DistributedPauliSum) = sum(Distributed.remotecall_fetch(_dps_len
 Gather a sharded sum back to one local `PauliSum` (debug/analysis; do not use on
 sums larger than node memory).
 """
-function collect_paulisum(dO::DistributedPauliSum{N,T}) where {N,T}
+function collect_paulisum(dO::DistributedPauliSum{N,W,T}) where {N,W,T}
     out = PauliSum(N, T)
     for pid in dO.workers
         local_terms = Distributed.remotecall_fetch(_dps_local_copy, pid, dO.id)
@@ -204,7 +213,7 @@ end
 Gather a sharded operator back to one local `SparsePauliVector` (debug/analysis;
 do not use on sums larger than node memory).
 """
-function collect_sparsepaulivector(dO::DistributedPauliSum{N,T}; kwargs...) where {N,T}
+function collect_sparsepaulivector(dO::DistributedPauliSum{N,W,T}; kwargs...) where {N,W,T}
     return SparsePauliVector(collect_paulisum(dO); T=T, kwargs...)
 end
 
@@ -232,7 +241,7 @@ function _dps_chunk_ranges(n::Int, k::Int)
 end
 
 # read-only over O; fill this chunk's sin buckets and record its anticommuting keys.
-function _rotate_chunk!(O::PauliSum{N,T}, ks, range, G, _sin, workers, stage, coskeys) where {N,T}
+function _rotate_chunk!(O::PauliSum{N,W,T}, ks, range, G, _sin, workers, stage, coskeys) where {N,W,T}
     for idx in range
         p = ks[idx]
         commute(p, G) && continue
@@ -246,8 +255,8 @@ function _rotate_chunk!(O::PauliSum{N,T}, ks, range, G, _sin, workers, stage, co
     return nothing
 end
 
-function _dps_rotate_local_typed!(id::Symbol, O::PauliSum{N,T}, G, θ::Real, workers,
-                                  threaded::Bool) where {N,T}
+function _dps_rotate_local_typed!(id::Symbol, O::PauliSum{N,W,T}, G, θ::Real, workers,
+                                  threaded::Bool) where {N,W,T}
     _cos = cos(θ)
     _sin = 1im*sin(θ)
     ks = collect(keys(O))
@@ -290,7 +299,7 @@ end
 # needed and a plain push! (no hashing / probing / rehashing of a staging Dict)
 # suffices. The merge/take/clear phases are container-agnostic (they iterate
 # (pb,c) pairs), so only the local rotation changes.
-function _rotate_chunk_vec!(O::AnyPauliSum{N,T}, ks, range, G, _sin, workers, stagevecs, coskeys) where {N,T}
+function _rotate_chunk_vec!(O::AnyPauliSum{N,W,T}, ks, range, G, _sin, workers, stagevecs, coskeys) where {N,W,T}
     single = length(workers) == 1
     w1 = workers[1]
     for idx in range
@@ -306,13 +315,13 @@ function _rotate_chunk_vec!(O::AnyPauliSum{N,T}, ks, range, G, _sin, workers, st
     return nothing
 end
 
-function _dps_rotate_local_typed_vec!(id::Symbol, O::AnyPauliSum{N,T}, G, θ::Real, workers,
-                                      threaded::Bool) where {N,T}
+function _dps_rotate_local_typed_vec!(id::Symbol, O::AnyPauliSum{N,W,T}, G, θ::Real, workers,
+                                      threaded::Bool) where {N,W,T}
     _cos = cos(θ)
     _sin = 1im*sin(θ)
     ks = collect(keys(O))
     nt = (threaded && Threads.nthreads() > 1 && length(ks) > 1) ? Threads.nthreads() : 1
-    VT = Tuple{PauliBasis{N},T}
+    VT = Tuple{PauliBasis{N,W},T}
     tstage = [Dict(pid => VT[] for pid in workers) for _ in 1:nt]
     tcos   = [Vector{eltype(ks)}() for _ in 1:nt]
 
@@ -418,20 +427,23 @@ function _dps_evolve_local_spv!(id::Symbol, G::PauliBasis{N}, θ::Real) where {N
     return nothing
 end
 
+# `threaded` is accepted and ignored: the single-worker SPV fast path delegates
+# to the local windowed kernel, whose rotation sweep is serial by design (it
+# owns the append buffer). Threading on this path happens across shards.
 function _dps_evolve_local_spv_sequence!(id::Symbol,
-                                         generators::Vector{<:PauliBasis{N}},
+                                         generators::Vector{<:PauliBasis{N,W}},
                                          angles::Vector{<:Real},
                                          truncation_thresh::Real,
                                          threaded::Bool,
-                                         window::Int) where {N}
+                                         window::Int) where {N,W}
     O = _dps_get(id)
-    gens = PauliBasis{N}[generators...]
+    gens = PauliBasis{N,W}[generators...]
+    angs = collect(Float64, angles)
     if truncation_thresh > 0
-        evolve!(O, gens, angles; window=window,
-                truncation=CoeffTruncation(truncation_thresh),
-                threaded=threaded)
+        evolve!(O, gens, angs; window=window,
+                truncation=CoeffTruncation(truncation_thresh))
     else
-        evolve!(O, gens, angles; window=window, threaded=threaded)
+        evolve!(O, gens, angs; window=window)
     end
     return nothing
 end
@@ -453,22 +465,22 @@ function _dps_merge_incoming!(id::Symbol, workers)
     end
     return nothing
 end
-function _dps_merge_bucket!(O::PauliSum{N,T}, bucket) where {N,T}
+function _dps_merge_bucket!(O::PauliSum{N,W,T}, bucket) where {N,W,T}
     for (pb, c) in bucket
         O[pb] = get(O, pb, zero(T)) + c
     end
     return O
 end
 
-function _dps_pending_dict!(id::Symbol, ::Type{PauliBasis{N}}, ::Type{T}) where {N,T}
+function _dps_pending_dict!(id::Symbol, ::Type{PauliBasis{N,W}}, ::Type{T}) where {N,W,T}
     return get!(_DPS_PENDING, id) do
-        Tuple{PauliBasis{N},T}[]
+        Tuple{PauliBasis{N,W},T}[]
     end
 end
 
-function _dps_rotate_pending_dict_typed!(id::Symbol, O::PauliSum{N,T},
-                                         G::PauliBasis{N}, θ::Real) where {N,T}
-    pending = _dps_pending_dict!(id, PauliBasis{N}, T)
+function _dps_rotate_pending_dict_typed!(id::Symbol, O::PauliSum{N,W,T},
+                                         G::PauliBasis{N,W}, θ::Real) where {N,W,T}
+    pending = _dps_pending_dict!(id, PauliBasis{N,W}, T)
     _cos = cos(θ)
     _sin = 1im * sin(θ)
     hi = length(pending)
@@ -489,13 +501,13 @@ function _dps_rotate_pending_dict_typed!(id::Symbol, O::PauliSum{N,T},
     end
     return nothing
 end
-_dps_rotate_pending_dict!(id::Symbol, G::PauliBasis{N}, θ::Real) where {N} =
+_dps_rotate_pending_dict!(id::Symbol, G::PauliBasis{N,W}, θ::Real) where {N,W} =
     _dps_rotate_pending_dict_typed!(id, _dps_get(id), G, θ)
 
-function _dps_route_pending_dict_typed!(id::Symbol, O::PauliSum{N,T},
-                                        workers) where {N,T}
-    pending = _dps_pending_dict!(id, PauliBasis{N}, T)
-    VT = Tuple{PauliBasis{N},T}
+function _dps_route_pending_dict_typed!(id::Symbol, O::PauliSum{N,W,T},
+                                        workers) where {N,W,T}
+    pending = _dps_pending_dict!(id, PauliBasis{N,W}, T)
+    VT = Tuple{PauliBasis{N,W},T}
     stage = Dict(pid => VT[] for pid in workers)
     for (pb, c) in pending
         push!(stage[_pauli_owner(pb, workers)], (pb, c))
@@ -545,8 +557,8 @@ workers; new sin-branch terms are routed to their owners and merged. `threaded`
 enables Julia-thread parallelism of each worker's local rotation (start the
 workers with `--threads=N`).
 """
-function evolve!(dO::DistributedPauliSum{N,T}, G::PauliBasis{N}, θ::Real;
-                 threaded::Bool=true) where {N,T}
+function evolve!(dO::DistributedPauliSum{N,W,T}, G::PauliBasis{N,W}, θ::Real;
+                 threaded::Bool=true) where {N,W,T}
     ws = dO.workers
     if dO.storage == :spv && length(ws) == 1
         _dps_fetch(_dps_evolve_local_spv!, ws[1], dO.id, G, θ)
@@ -574,8 +586,8 @@ Same result as [`evolve!`](@ref) using the Vector-staging local rotation
 loop. This is also the default Dict-backed distributed path; the explicit entry
 point is kept for callers that want to request it directly.
 """
-function evolve_vec!(dO::DistributedPauliSum{N,T}, G::PauliBasis{N}, θ::Real;
-                     threaded::Bool=true) where {N,T}
+function evolve_vec!(dO::DistributedPauliSum{N,W,T}, G::PauliBasis{N,W}, θ::Real;
+                     threaded::Bool=true) where {N,W,T}
     ws = dO.workers
     @sync for pid in ws
         @async _dps_fetch(_dps_rotate_local_vec!, pid, dO.id, G, θ, ws, threaded)
@@ -608,9 +620,9 @@ _dps_coeff_clip!(id::Symbol, thresh::Real) = (coeff_clip!(_dps_get(id), thresh);
 Apply a sequence of rotations (e.g. from `trotterize`) to a sharded sum, clipping
 after each rotation when `truncation_thresh > 0`. Mutates and returns `dO`.
 """
-function evolve!(dO::DistributedPauliSum{N,T}, generators::Vector{<:PauliBasis{N}},
+function evolve!(dO::DistributedPauliSum{N,W,T}, generators::Vector{<:PauliBasis{N,W}},
                  angles::Vector{<:Real}; truncation_thresh::Real=0.0,
-                 threaded::Bool=true, window::Int=1) where {N,T}
+                 threaded::Bool=true, window::Int=1) where {N,W,T}
     length(generators) == length(angles) || throw(DimensionMismatch("generators and angles must match"))
     window >= 1 || throw(ArgumentError("window must be >= 1"))
     if dO.storage == :spv && length(dO.workers) == 1

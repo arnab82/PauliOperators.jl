@@ -5,8 +5,8 @@ module PauliOperators
     using StaticArrays
     using Random
     using BitIntegers
-    using Distributed
 
+    include("word.jl")
     include("helpers.jl")
     include("type_PauliBasis.jl")
     include("type_Pauli.jl")
@@ -36,7 +36,6 @@ module PauliOperators
     include("analysis.jl")
     include("channels.jl")
     include("transformations.jl")
-    include("distributed.jl")
 
     const ⊗ = otimes
     const ⊕ = osum
@@ -58,9 +57,9 @@ module PauliOperators
     export otimes, osum
     export expectation_value
     export matrix_element
-    export inner_product, inner_product_threaded
-    export mult_threaded
+    export inner_product
 
+    export word_type
     export symplectic_phase
     export coeff
     export commute
@@ -83,6 +82,7 @@ module PauliOperators
     export MajoranaWeightTruncation, WeightDampedTruncation, CompositeTruncation
     export StochasticCoeffTruncation, StochasticSamplingTruncation
     export AdaptiveTruncation
+    export PauliSubspaceProjector, QubitSubspaceProjector
     export NoCorrection, EnergyCorrection, EnergyVarianceCorrection
     export truncate!
 
@@ -112,10 +112,4 @@ module PauliOperators
 
     # Transformations
     export jordan_wigner, boson_to_paulis
-
-    # Multinode (across-node) evolution
-    export uinttype
-    export DistributedPauliSum, distribute, collect_paulisum, collect_sparsepaulivector, evolve_vec!
-    export pauli_storage
-    export ensure_pauli_workers!, sharded_summary, opnorm2, destroy!
 end
