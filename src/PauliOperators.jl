@@ -5,6 +5,7 @@ module PauliOperators
     using StaticArrays
     using Random
     using BitIntegers
+    import Distributed
 
     include("word.jl")
     include("helpers.jl")
@@ -36,6 +37,7 @@ module PauliOperators
     include("analysis.jl")
     include("channels.jl")
     include("transformations.jl")
+    include("distributed.jl")
 
     const ⊗ = otimes
     const ⊕ = osum
@@ -112,4 +114,12 @@ module PauliOperators
 
     # Transformations
     export jordan_wigner, boson_to_paulis
+
+    # Distributed (hash-sharded across Distributed.jl workers; each shard is a
+    # local PauliSum or SparsePauliVector, so N > 128 and both backends carry
+    # over unchanged)
+    export DistributedPauliSum
+    export distribute, collect_paulisum, collect_sparsepaulivector
+    export ensure_pauli_workers!, pauli_storage, destroy!
+    export evolve_vec!, opnorm2, sharded_summary
 end
