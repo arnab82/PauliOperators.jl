@@ -31,7 +31,10 @@ Hermitian operators and halves coefficient bandwidth).
 Three parallel-array buffer sets:
 
 - live `z/x/c[1:n]`: current terms, **sorted by strictly increasing
-  `(z, x)` key**, duplicate-free.
+  `(x, z)` key — x-major** (see `_key_lt` in spv_kernels.jl),
+  duplicate-free. x-major makes all terms sharing an x-string contiguous,
+  which is what the fused truncation corrections and the diagonal-prefix
+  expectation value rely on.
 - append `az/ax/ac[1:an]`: sin-branch terms created during an evolution
   window, unsorted. `an == 0` whenever any public API other than the
   evolve internals runs.

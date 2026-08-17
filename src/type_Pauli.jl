@@ -87,6 +87,11 @@ end
 Construct a `Pauli{N}` from integer bitstrings `z` and `x` with scalar `s=1`.
 """
 function Pauli(z::I, x::I, N) where I<:Integer
+    # Bit-level bounds check: `Int128(2)^N` overflows at N = 128, and masks
+    # touching the top qubit legitimately set the sign bit of a signed input.
+    # Mask against the N-bit word instead of comparing to `2^N`, so this stays
+    # correct at every supported width (UInt64 through UInt1024) rather than
+    # capping at 128 as the narrow-word check on `main` does.
     W = word_type(N)
     m = _nbit_mask(W, N)
     (z >= 0 && (z % W) & ~m == zero(W)) || throw(DimensionMismatch)
