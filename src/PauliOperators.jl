@@ -127,9 +127,20 @@ module PauliOperators
     # Transformations
     export jordan_wigner, boson_to_paulis
 
-    # Sharded propagation (GF(2) rank maps, binned and shared-memory sums)
+    # Sharded propagation (GF(2) rank maps, binned and shared-memory sums).
+    # Mirrors the upstream `shared1` export list, with WindowCounters renamed
+    # ShardedCounters (bitint already has a WindowCounters for the SPV path).
     export RankMap, RankRow
+    export bin_index, bin_shift, nbits, nbins
     export BinnedPauliSum
+    export rebin!, check_binning, bin_histogram
+    export nonempty_bins, owned_bins, default_bin_owner
+    export CompiledCircuit, compile, gf2_span, merge_bins!
+    export PropagationCounters
+    export protected_row_basis, rand_valid_row, greedy_bisection_rankmap
+    export swap_row!
     export ShardedPauliSum
-    export compile, ShardedCounters
+    export check_sharding, merge_shards!
+    export ShardedCounters
+    export pin_engine!
 end

@@ -200,6 +200,21 @@ function _boundary_serial!(S::ShardedPauliSum, fref::Base.RefValue{MergeFilter},
                            hist::Vector{Int},
                            counters::Union{Nothing,ShardedCounters}, w::Int;
                            adaptive_update::Bool=true)
+    # A correction that is NOT a fused scalar drop-sink (i.e. anything other than
+    # NoCorrection/EnergyCorrection -- see `_needs_merged_measure` in
+    # spv_evolve.jl) must be measured on MERGED state. `_measure` walks only the
+    # live buffers, so measuring before the merge misses every pending append and
+    # reports a smaller operator than the post-merge one -- the accumulated
+    # "loss" then comes out large and NEGATIVE. Merge unfiltered first, measure,
+    # then apply the real filter, exactly as the SPV boundary does.
+    if _needs_merged_measure(correction)
+        merge_shards!(S, NOFILTER; counters, w)
+        before = _measure(S, correction)
+        _compact_all!(S, fref[])
+        after = _measure(S, correction)
+        _accumulate!(correction, before, after)
+        return S
+    end
     before = _measure(S, correction)
     merge_shards!(S, fref[]; counters, w)
     if adapt !== nothing && adaptive_update

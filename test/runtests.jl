@@ -21,4 +21,5 @@ using Test
     include("test_channels.jl")
     include("test_transformations.jl")
     include("test_large_N.jl")
+    include("test_sharded.jl")
 end
