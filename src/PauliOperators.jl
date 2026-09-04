@@ -37,6 +37,20 @@ module PauliOperators
     include("channels.jl")
     include("transformations.jl")
 
+    # Shared-memory sharded engine: GF(2) rank maps partition the Pauli basis
+    # into shards, each with its own sorted storage. A rotation displaces a
+    # whole shard by a fixed XOR, so inter-shard traffic is pairwise and a
+    # generator with zero displacement costs none at all. Ported from the
+    # `shared1` branch onto bitint storage (parametric word type W), so it
+    # works past 128 qubits and alongside SparsePauliVector.
+    include("type_RankMap.jl")
+    include("type_BinnedPauliSum.jl")
+    include("binned_evolve.jl")
+    include("type_ShardedPauliSum.jl")
+    include("sharded_kernels.jl")
+    include("sharded_evolve.jl")
+    include("sharded_threads.jl")
+
     const ⊗ = otimes
     const ⊕ = osum
     const PHASE_TBL = SVector{4}([1, 1im, -1, -1im])
@@ -112,4 +126,10 @@ module PauliOperators
 
     # Transformations
     export jordan_wigner, boson_to_paulis
+
+    # Sharded propagation (GF(2) rank maps, binned and shared-memory sums)
+    export RankMap, RankRow
+    export BinnedPauliSum
+    export ShardedPauliSum
+    export compile, ShardedCounters
 end
