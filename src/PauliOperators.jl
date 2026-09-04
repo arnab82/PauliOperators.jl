@@ -143,4 +143,5 @@ module PauliOperators
     export check_sharding, merge_shards!
     export ShardedCounters
     export pin_engine!
+    export ShardedVectorCorrection, correction_width, measure_shard!
 end

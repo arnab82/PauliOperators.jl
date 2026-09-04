@@ -190,6 +190,47 @@ function truncate!(S::ShardedPauliSum, strategy::TruncationStrategy,
     return S
 end
 
+"""
+    ShardedVectorCorrection
+
+A `CorrectionAccumulator` whose measurement is a **vector reduction over
+shards**, so the THREADED driver can compute it exactly the way it computes the
+energy: every thread measures only the shards it owns, then thread 1 reduces.
+
+This is what lets a correction run multithreaded. `EnergyCorrection` reduces to
+one `Float64` per thread (`ThreadState.acc`); an observable like the per-site
+OTOC needs a length-`N` vector instead, which is the only thing that was
+actually hardcoded.
+
+Implement three methods:
+
+    correction_width(c)              -> Int          length of the reduction
+    measure_shard!(dst, shard, c)    -> nothing      ACCUMULATE into dst
+    _accumulate!(c, before, after)                   both are Vector{Float64}
+
+`measure_shard!` sees only a shard's **live** buffer (`sh.z/x/c[1:sh.n]`). That
+is deliberate and it is why the driver merges before measuring: a quadratic
+observable cannot be evaluated on unmerged state, since two pending appends
+sharing a key contribute `|c1+c2|^2`, not `|c1|^2 + |c2|^2`.
+"""
+abstract type ShardedVectorCorrection <: CorrectionAccumulator end
+
+"""
+    correction_width(c::ShardedVectorCorrection) -> Int
+
+Length of the per-thread reduction buffer.
+"""
+function correction_width end
+
+"""
+    measure_shard!(dst::Vector{Float64}, sh::Shard, c::ShardedVectorCorrection)
+
+Accumulate this shard's contribution into `dst` (do NOT zero it).
+"""
+function measure_shard! end
+
+_needs_merged_measure(::ShardedVectorCorrection) = true
+
 # Serial window/early boundary: measure → merge (strict filter) →
 # [adaptive threshold update + optional immediate re-clip] → measure →
 # accumulate. The re-clip sits inside the measurement span, so corrections
@@ -274,9 +315,11 @@ function evolve!(S::ShardedPauliSum{N,W,T}, circ::CompiledCircuit{N};
                                  : _adaptive_filter(adapt.min_thresh))
     flocal = _compile_filter(local_truncation)
     if S.nthreads > 1
-        correction isa Union{NoCorrection,EnergyCorrection} ||
-            error("the threaded driver supports NoCorrection and EnergyCorrection " *
-                  "(use nthreads=1 for custom correction accumulators)")
+        correction isa Union{NoCorrection,EnergyCorrection,ShardedVectorCorrection} ||
+            error("the threaded driver supports NoCorrection, EnergyCorrection and " *
+                  "ShardedVectorCorrection (a vector reduction over shards). Either " *
+                  "subtype ShardedVectorCorrection -- see its docstring -- or use " *
+                  "nthreads=1 for an arbitrary accumulator.")
         return _evolve_threaded!(S, circ, fref, adapt, flocal, correction, counters,
                                  Float64(rebalance_threshold))
     end

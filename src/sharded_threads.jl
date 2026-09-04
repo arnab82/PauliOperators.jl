@@ -134,6 +134,27 @@ end
 
 # ⟨ψ|·|ψ⟩ over owned shards, INCLUDING pending appends (exact pre-merge
 # expectation by linearity). Safe only in quiescent phases (cursors stable).
+# Vector analogue of `_expectation_owned`: each thread accumulates ONLY the
+# shards it owns into its own buffer, so the measurement is as parallel as the
+# merge. Thread 1 reduces the per-thread buffers at the barrier.
+function _measure_owned_vec!(dst::Vector{Float64}, S::ShardedPauliSum,
+                             tid::Int, corr::ShardedVectorCorrection)
+    fill!(dst, 0.0)
+    @inbounds for j in 1:nshards(S)
+        S.owner[j] == tid || continue
+        measure_shard!(dst, S.shards[j], corr)
+    end
+    return dst
+end
+
+function _reduce_vec!(dst::Vector{Float64}, cbufs::Vector{Vector{Float64}}, nt::Int)
+    copyto!(dst, cbufs[1])
+    @inbounds for u in 2:nt, k in eachindex(dst)
+        dst[k] += cbufs[u][k]
+    end
+    return dst
+end
+
 function _expectation_owned(S::ShardedPauliSum{N,W,T}, tid::Int, kv::W) where {N,W,T}
     acc = zero(T)
     @inbounds for j in 1:nshards(S)
@@ -224,12 +245,19 @@ function _worker!(S::ShardedPauliSum{N,W,T}, tid::Int, bar::SpinBarrier,
                   hists::Vector{Vector{Int}},
                   counters::Union{Nothing,ShardedCounters},
                   rebalance_threshold::Float64,
-                  pairs::Vector{Tuple{Int,Int}}, loads::Vector{Int}) where {N,W,T}
+                  pairs::Vector{Tuple{Int,Int}}, loads::Vector{Int},
+                  cbufs::Vector{Vector{Float64}},
+                  vbefore::Vector{Float64}, vafter::Vector{Float64}) where {N,W,T}
     st = tls[tid]
     nt = S.nthreads
     L = length(shifts)
     ls = false
-    docorr = !(correction isa NoCorrection)
+    docorr  = !(correction isa NoCorrection)
+    # A vector correction is quadratic in the coefficients, so it cannot be
+    # evaluated on unmerged state (two pending appends sharing a key contribute
+    # |c1+c2|^2, not |c1|^2+|c2|^2). It therefore takes a different boundary:
+    # unfiltered merge -> measure -> apply the filter -> measure, all per-thread.
+    vcorr = correction isa ShardedVectorCorrection
     gcbase = Base.gc_num()
     t0 = UInt64(0)
     eb = 0.0
@@ -247,18 +275,34 @@ function _worker!(S::ShardedPauliSum{N,W,T}, tid::Int, bar::SpinBarrier,
                 allok &= tls[u].ok
             end
             if !allok                              # capacity-forced early merge
-                if docorr
+                if docorr && !vcorr
                     st.acc = real(_expectation_owned(S, tid, kv))
                     ls = _wait!(bar, ls)
                     tid == 1 && (eb = _sum_acc(tls, nt))
                 end
-                tin, tout, _ = _merge_owned!(S, tid, fref[])
+                # Same reasoning as the window boundary below: a vector
+                # correction is quadratic, so merge unfiltered, measure, then
+                # apply the filter and measure again.
+                tin, tout, _ = _merge_owned!(S, tid, vcorr ? NOFILTER : fref[])
                 st.merge_in += tin
                 st.merge_out += tout
                 ls = _wait!(bar, ls)               # merges done
                 _reset_cursor_row!(S, tid)
                 ls = _wait!(bar, ls)               # cursors reset
-                if docorr
+                if docorr && vcorr
+                    _measure_owned_vec!(cbufs[tid], S, tid, correction)
+                    ls = _wait!(bar, ls)
+                    tid == 1 && _reduce_vec!(vbefore, cbufs, nt)
+                    ls = _wait!(bar, ls)           # vbefore visible
+                    _compact_owned!(S, tid, fref[])
+                    ls = _wait!(bar, ls)           # filtering done everywhere
+                    _measure_owned_vec!(cbufs[tid], S, tid, correction)
+                    ls = _wait!(bar, ls)
+                    if tid == 1
+                        _reduce_vec!(vafter, cbufs, nt)
+                        _accumulate!(correction, vbefore, vafter)
+                    end
+                elseif docorr
                     st.acc = real(_expectation_owned(S, tid, kv))
                     ls = _wait!(bar, ls)
                     tid == 1 && _accumulate!(correction,
@@ -292,12 +336,14 @@ function _worker!(S::ShardedPauliSum{N,W,T}, tid::Int, bar::SpinBarrier,
 
             if i % window == 0 || i == L
                 tid == 1 && (t0 = time_ns())
-                if docorr                          # pre-merge expectation
+                if docorr && !vcorr                # pre-merge expectation
                     st.acc = real(_expectation_owned(S, tid, kv))
                     ls = _wait!(bar, ls)
                     tid == 1 && (eb = _sum_acc(tls, nt))
                 end
-                tin, tout, _ = _merge_owned!(S, tid, fref[])
+                # Unfiltered merge first for a vector correction, so `before` is
+                # measured on merged state; the real filter is applied below.
+                tin, tout, _ = _merge_owned!(S, tid, vcorr ? NOFILTER : fref[])
                 st.merge_in += tin
                 st.merge_out += tout
                 ls = _wait!(bar, ls)               # merges done
@@ -330,7 +376,21 @@ function _worker!(S::ShardedPauliSum{N,W,T}, tid::Int, bar::SpinBarrier,
                         ls = _wait!(bar, ls)       # fref/reclip visible
                         reclip[] && _compact_owned!(S, tid, fref[])
                     end
-                    if docorr                      # post-merge (and post-re-clip)
+                    if docorr && vcorr             # merged -> measure -> filter -> measure
+                        adapt !== nothing && (ls = _wait!(bar, ls))
+                        _measure_owned_vec!(cbufs[tid], S, tid, correction)
+                        ls = _wait!(bar, ls)
+                        tid == 1 && _reduce_vec!(vbefore, cbufs, nt)
+                        ls = _wait!(bar, ls)       # vbefore visible
+                        _compact_owned!(S, tid, fref[])
+                        ls = _wait!(bar, ls)       # filtering done everywhere
+                        _measure_owned_vec!(cbufs[tid], S, tid, correction)
+                        ls = _wait!(bar, ls)
+                        if tid == 1
+                            _reduce_vec!(vafter, cbufs, nt)
+                            _accumulate!(correction, vbefore, vafter)
+                        end
+                    elseif docorr                  # post-merge (and post-re-clip)
                         adapt !== nothing && (ls = _wait!(bar, ls))
                         st.acc = real(_expectation_owned(S, tid, kv))
                         ls = _wait!(bar, ls)
@@ -414,6 +474,10 @@ function _evolve_threaded!(S::ShardedPauliSum{N,W,T}, circ::CompiledCircuit{N},
     kv = correction isa EnergyCorrection{N} ? correction.ψ.v % W : zero(W)
     reclip = Ref(false)
     hists = [zeros(Int, _HIST_BINS) for _ in 1:nt]
+    cw = correction isa ShardedVectorCorrection ? correction_width(correction) : 0
+    cbufs = [zeros(Float64, cw) for _ in 1:nt]
+    vbefore = zeros(Float64, cw)
+    vafter  = zeros(Float64, cw)
     bar = SpinBarrier(nt)
     tls = [ThreadState() for _ in 1:nt]
     pairs = Vector{Tuple{Int,Int}}(undef, nshards(S))
@@ -424,13 +488,14 @@ function _evolve_threaded!(S::ShardedPauliSum{N,W,T}, circ::CompiledCircuit{N},
                                                gz, gx, ng, cosv, sinv, circ.window,
                                                fref, adapt, flocal, correction, kv,
                                                reclip, hists, counters,
-                                               rebalance_threshold, pairs, loads)
+                                               rebalance_threshold, pairs, loads,
+                                               cbufs, vbefore, vafter)
     end
     err = nothing
     try
         _worker!(S, 1, bar, tls, circ.shifts, gz, gx, ng, cosv, sinv, circ.window,
                  fref, adapt, flocal, correction, kv, reclip, hists, counters,
-                 rebalance_threshold, pairs, loads)
+                 rebalance_threshold, pairs, loads, cbufs, vbefore, vafter)
     catch e
         err = e                    # keep the primary failure, not the abort echoes
     end

@@ -111,10 +111,19 @@ end
             A = rand(RankMap{N}, 3)
             circ = compile(A, gens, angs; window=4)
             trunc = CoeffTruncation(1e-12)
-            S1 = ShardedPauliSum(_probe(N), A; T=Float64, nthreads=1)
-            evolve!(S1, circ; truncation=trunc)
-            Sn = ShardedPauliSum(_probe(N), A; T=Float64, nthreads=Threads.nthreads())
-            evolve!(Sn, circ; truncation=trunc)
+            # Capacity matters for this comparison. A capacity-forced EARLY merge
+            # truncates off-schedule, and it fires at different points for
+            # different thread counts (measured 32 vs 25 at N=140), so the two
+            # runs would then integrate genuinely different truncation cadences.
+            # Size the buffers so no early merge fires, and assert that.
+            big = (; min_capacity = 1 << 20, append_factor = 8.0)
+            nw = cld(length(gens), 4)
+            S1 = ShardedPauliSum(_probe(N), A; T=Float64, nthreads=1, big...)
+            c1 = ShardedCounters(nw); evolve!(S1, circ; truncation=trunc, counters=c1)
+            Sn = ShardedPauliSum(_probe(N), A; T=Float64, nthreads=Threads.nthreads(), big...)
+            cn = ShardedCounters(nw); evolve!(Sn, circ; truncation=trunc, counters=cn)
+            @test sum(c1.early_merges) == 0
+            @test sum(cn.early_merges) == 0
             @test length(Sn) == length(S1)
             @test _maxdiff(PauliSum(Sn), PauliSum(S1)) < 1e-12
         end
@@ -165,6 +174,85 @@ end
         @test corr.acc >= 0                       # a loss, never a gain
         # unitary evolution preserves the 2-norm, so kept + discarded == 1
         @test isapprox(kept + corr.acc, 1.0; atol=1e-8)
+    end
+
+    # A VECTOR correction (ShardedVectorCorrection) is the interface that lets a
+    # correction run multithreaded: each thread measures the shards it owns and
+    # thread 1 reduces. It must give the identical answer at every thread count,
+    # and must survive a capacity-forced EARLY merge -- a separate code path that
+    # only fires once the append buffers overflow, i.e. at large populations.
+    mutable struct _SiteLoss <: PauliOperators.ShardedVectorCorrection
+        acc::Vector{Float64}
+        N::Int
+    end
+    PauliOperators.correction_width(c::_SiteLoss) = c.N
+    function PauliOperators.measure_shard!(dst::Vector{Float64}, sh, ::_SiteLoss)
+        @inbounds for i in 1:sh.n
+            w2 = abs2(sh.c[i]); w2 == 0.0 && continue
+            m = sh.x[i]; j = 1
+            while m != zero(m)
+                isodd(m & one(m)) && (dst[j] += w2)
+                m >>= 1; j += 1
+            end
+        end
+        return nothing
+    end
+    PauliOperators._measure(S::ShardedPauliSum, c::_SiteLoss) =
+        (d = zeros(Float64, c.N); for sh in S.shards; PauliOperators.measure_shard!(d, sh, c); end; d)
+    PauliOperators._accumulate!(c::_SiteLoss, before, after) =
+        (c.acc .+= (before .- after); nothing)
+
+    @testset "vector correction is thread-count independent" begin
+        N = 14
+        H = _chain_H(N)
+        gens, angs = trotterize(H, 0.8, n_trotter=6, order=2)
+        A = rand(RankMap{N}, 3)
+        circ = compile(A, gens, angs; window=1)
+        trunc = CoeffTruncation(1e-5)
+        ref = nothing
+        for nt in unique([1, min(2, Threads.nthreads()), Threads.nthreads()])
+            S = ShardedPauliSum(_probe(N), A; T=Float64, nthreads=nt)
+            c = _SiteLoss(zeros(Float64, N), N)
+            evolve!(S, circ; truncation=trunc, correction=c)
+            @test all(c.acc .>= -1e-12)                 # a loss, never a gain
+            if ref === nothing
+                ref = (copy(c.acc), PauliSum(S))
+                @test sum(ref[1]) > 0                    # the test must actually truncate
+            else
+                @test maximum(abs.(c.acc .- ref[1])) < 1e-10
+                @test _maxdiff(PauliSum(S), ref[2]) < 1e-12
+            end
+        end
+    end
+
+    @testset "vector correction runs correctly through early merges" begin
+        # The capacity-forced early merge is a SEPARATE code path in the worker
+        # from the window boundary, and it fires only once the append buffers
+        # overflow -- so it needs its own coverage. Deliberately tiny buffers
+        # force it.
+        #
+        # Bit-equality across thread counts is NOT asserted here: early merges
+        # fire at different points for different nt, so the runs integrate
+        # different truncation cadences by construction. What must hold either
+        # way is the bookkeeping -- the correction is a loss, never a gain, and
+        # kept + discarded accounts for the whole (unitarily conserved) 2-norm.
+        N = 16
+        H = _chain_H(N)
+        gens, angs = trotterize(H, 1.0, n_trotter=8, order=2)
+        A = rand(RankMap{N}, 3)
+        circ = compile(A, gens, angs; window=8)
+        trunc = CoeffTruncation(1e-7)
+        nw = cld(length(gens), 8)
+        for nt in unique([1, Threads.nthreads()])
+            S = ShardedPauliSum(_probe(N), A; T=Float64, nthreads=nt,
+                                min_capacity=1024, append_factor=1.0)
+            c = _SiteLoss(zeros(Float64, N), N)
+            ctr = ShardedCounters(nw)
+            evolve!(S, circ; truncation=trunc, correction=c, counters=ctr)
+            @test sum(ctr.early_merges) > 0            # the path was actually taken
+            @test all(c.acc .>= -1e-12)                # a loss, never a gain
+            @test length(S) > 0
+        end
     end
 
     @testset "compile guards against a stale rank map" begin
